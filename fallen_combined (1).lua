@@ -3339,6 +3339,9 @@ hooks.on_render(function()
 
     nsafe(function()
         Drawing.DrawText(12, 12, "NPC: " .. tostring(npc_debug), 1, 1, 0, 1)
+        local mb = (UIManager and UIManager.GetCheckboxValue and UIManager.GetCheckboxValue("fn_mil_box")) and "1" or "0"
+        local bb = (UIManager and UIManager.GetCheckboxValue and UIManager.GetCheckboxValue("fn_boss_box")) and "1" or "0"
+        Drawing.DrawText(12, 26, "box mil=" .. tostring(mb) .. " boss=" .. tostring(bb), 0.8, 0.8, 0.2, 1)
     end)
 
     if not nui_check("fn_master", NPC_CFG.enabled) then return end
@@ -3370,307 +3373,774 @@ _G.FallenNPC_Order = npc_order
 _G.FallenNPC_CFG = NPC_CFG
 
 ----------------------------------------------------------------
--- NPC AIMBOT (Infernal-style: keybind + Military/Bosses + bone + range)
--- Built-in cheat aimbot = players only. This aims at MilitaryHitbox / bosses.
+--[[
+  AIMBOT — Blueberry official primitives only
+  Docs: roblox-modification-functions (aim.*), windows-functions, classes (players, hooks), recipes 1 & 9
+
+  Keybind:
+    CreateKeybind (menu) OR "Set Aim Key" button with 0.5s ignore after click so LMB is NOT bound.
+  Aim path (priority):
+    1) Windows.MoveMouse smoothed toward screen pos  (recipe 9 — camera follows)
+    2) aim.write_mouse(screen)                       (recipe 1 — mouse service)
+    3) aim.set_camera_rotation(aim.look_at_matrix)   (fallback)
+  Targets:
+    players.get_all / head_pos + NPC cache (MilitaryHitbox)
+]]
 ----------------------------------------------------------------
-local NAIM = {
-    enabled = false,
-    fov = 150,
-    smooth = 5,
-    range = 500,
-    bone = 0, -- 0 Head, 1 Torso, 2 Closest
-    sticky = true,
-    prediction = true,
-    drop = false,
-    mil = true,
-    boris = true,
-    bruno = true,
-    brutus = true,
+do
+local AIM = {
+    vk = 0,
+    capture = false,
+    capture_until = 0,
+    locked = nil, -- {type="player", addr=...} | {type="npc", key=...}
+    -- hist[key] = {x,y,z,t, svx,svy,svz, sax,say,saz}
+    hist = {},
+    hz = { id = nil, until_ms = 0, mul = 1, next = 0, ox = 0, oy = 0, oz = 0 },
+    last_frame_t = 0,
+    frame_dt = 1/60,
+    ping_s = 0.05, -- estimated RTT/2 fallback ~50ms one-way; override via slider
 }
 
-local naim_locked = nil
-local naim_prev = {} -- key -> {x,y,z,t}
+-- Fallen ballistic approx (studs/s, gravity scale). Tuned for long-range lead.
+local WEAPON = {
+    ["Military Barret"] = { speed = 1500, gravity = 25 },
+    ["Military Barrett"] = { speed = 1500, gravity = 25 },
+    ["Military M4A1"] = { speed = 1000, gravity = 18 },
+    ["Military M39"] = { speed = 900, gravity = 18 },
+    ["Military MP7"] = { speed = 750, gravity = 15 },
+    ["Military PKM"] = { speed = 850, gravity = 18 },
+    ["Military USP"] = { speed = 650, gravity = 12 },
+    ["Military AA12"] = { speed = 550, gravity = 15 },
+    ["Military Grenade Launcher"] = { speed = 350, gravity = 55 },
+    ["Bruno's M4A1"] = { speed = 1000, gravity = 18 },
+    ["Salvaged AK47"] = { speed = 800, gravity = 15 },
+    ["Salvaged AK74u"] = { speed = 750, gravity = 15 },
+    ["Salvaged AK4"] = { speed = 800, gravity = 15 },
+    ["Salvaged Sniper"] = { speed = 1100, gravity = 20 },
+    ["Salvaged M14"] = { speed = 850, gravity = 18 },
+    ["Salvaged SMG"] = { speed = 700, gravity = 12 },
+    ["Salvaged Skorpion"] = { speed = 650, gravity = 12 },
+    ["Salvaged Python"] = { speed = 750, gravity = 15 },
+    ["Salvaged P250"] = { speed = 650, gravity = 12 },
+    ["Salvaged Pipe Rifle"] = { speed = 800, gravity = 20 },
+    ["Salvaged Pump Action"] = { speed = 550, gravity = 15 },
+    ["Salvaged Shotgun"] = { speed = 550, gravity = 15 },
+    ["Salvaged Double Barrel"] = { speed = 550, gravity = 15 },
+    ["Salvaged Break Action"] = { speed = 550, gravity = 15 },
+    ["Salvaged RPG"] = { speed = 400, gravity = 60 },
+    ["Salvaged Grenade Launcher"] = { speed = 350, gravity = 55 },
+    ["Crossbow"] = { speed = 400, gravity = 35 },
+    ["Wooden Bow"] = { speed = 300, gravity = 30 },
+    ["Nail Gun"] = { speed = 350, gravity = 20 },
+    ["Default"] = { speed = 1000, gravity = 18 },
+}
 
-local function naim_parent(id)
-    nsafe(function() UIManager.SetElementParent(id, TAB_ID) end)
+local function parent(id)
+    pcall(function() UIManager.SetElementParent(id, TAB_ID) end)
 end
 
-nsafe(function() UIManager.CreateSeparator("fn_naim_sep") end); naim_parent("fn_naim_sep")
-nsafe(function() UIManager.CreateText("fn_naim_title", "NPC Aimbot") end); naim_parent("fn_naim_title")
+-- UI
+pcall(function() UIManager.CreateSeparator("aim_sep0") end); parent("aim_sep0")
+pcall(function() UIManager.CreateText("aim_title", "Aimbot (Players + NPCs)") end); parent("aim_title")
+pcall(function() UIManager.CreateCheckbox("aim_en", "Enable Aimbot", false) end); parent("aim_en")
+pcall(function() UIManager.CreateCheckbox("aim_players", "Target Players", true) end); parent("aim_players")
+pcall(function() UIManager.CreateCheckbox("aim_npcs", "Target NPCs", true) end); parent("aim_npcs")
 
-nsafe(function()
-    UIManager.CreateCheckbox("fn_naim_en", "Enable NPC Aimbot", false, function(v)
-        NAIM.enabled = v and true or false
-    end)
-end); naim_parent("fn_naim_en")
-
--- кейбинд: нажал (...) -> нажал клавишу
-nsafe(function()
+-- Official CreateKeybind (default E so first click is not empty/LMB chaos)
+pcall(function()
     if UIManager.CreateKeybind then
-        UIManager.CreateKeybind("fn_naim_key", "Aim Key", 0)
+        local def = (VK and VK.E) or 0x45
+        UIManager.CreateKeybind("aim_keybind", "Aim Key (hold)", def)
     end
-end); naim_parent("fn_naim_key")
+end)
+parent("aim_keybind")
 
-nsafe(function() UIManager.CreateSeparator("fn_naim_sep_npc") end); naim_parent("fn_naim_sep_npc")
-nsafe(function() UIManager.CreateText("fn_naim_npc_h", "NPC") end); naim_parent("fn_naim_npc_h")
+-- Backup: Set Aim Key button (LMB-safe capture)
+pcall(function()
+    UIManager.CreateButton("aim_setkey", "Set Aim Key (keyboard)", function()
+        AIM.capture = true
+        AIM.capture_until = tick() + 0.55
+        if notify then notify("Press a KEYBOARD key now (mouse ignored 0.55s)", "normal") end
+    end)
+end)
+parent("aim_setkey")
+pcall(function() UIManager.CreateText("aim_key_txt", "Custom Key: none") end); parent("aim_key_txt")
 
-nsafe(function()
-    UIManager.CreateCheckbox("fn_naim_mil", "Military", true, function(v) NAIM.mil = v and true or false end)
-end); naim_parent("fn_naim_mil")
-nsafe(function()
-    UIManager.CreateCheckbox("fn_naim_bruno", "Bruno", true, function(v) NAIM.bruno = v and true or false end)
-end); naim_parent("fn_naim_bruno")
-nsafe(function()
-    UIManager.CreateCheckbox("fn_naim_boris", "Boris", true, function(v) NAIM.boris = v and true or false end)
-end); naim_parent("fn_naim_boris")
-nsafe(function()
-    UIManager.CreateCheckbox("fn_naim_brutus", "Brutus", true, function(v) NAIM.brutus = v and true or false end)
-end); naim_parent("fn_naim_brutus")
+pcall(function() UIManager.CreateSeparator("aim_sep1") end); parent("aim_sep1")
+pcall(function() UIManager.CreateText("aim_npc_h", "NPC filters") end); parent("aim_npc_h")
+pcall(function() UIManager.CreateCheckbox("aim_mil", "Military", true) end); parent("aim_mil")
+pcall(function() UIManager.CreateCheckbox("aim_bruno", "Bruno", true) end); parent("aim_bruno")
+pcall(function() UIManager.CreateCheckbox("aim_boris", "Boris", true) end); parent("aim_boris")
+pcall(function() UIManager.CreateCheckbox("aim_brutus", "Brutus", true) end); parent("aim_brutus")
 
-nsafe(function() UIManager.CreateSeparator("fn_naim_sep_opt") end); naim_parent("fn_naim_sep_opt")
-nsafe(function() UIManager.CreateText("fn_naim_bone_h", "Target Bone: 0=Head 1=Torso 2=Closest") end); naim_parent("fn_naim_bone_h")
-nsafe(function() UIManager.CreateSliderInt("fn_naim_bone", "Bone", 0, 2, 0) end); naim_parent("fn_naim_bone")
-nsafe(function() UIManager.CreateSliderInt("fn_naim_range", "Range (m)", 50, 1000, 500) end); naim_parent("fn_naim_range")
-nsafe(function() UIManager.CreateSliderInt("fn_naim_fov", "FOV", 20, 400, 150) end); naim_parent("fn_naim_fov")
-nsafe(function() UIManager.CreateSliderInt("fn_naim_smooth", "Smooth", 1, 30, 5) end); naim_parent("fn_naim_smooth")
+pcall(function() UIManager.CreateSeparator("aim_sep2") end); parent("aim_sep2")
+pcall(function() UIManager.CreateText("aim_part_h", "Aim Part") end); parent("aim_part_h")
+pcall(function()
+    UIManager.CreateCheckbox("aim_part_head", "Head", true, function(v)
+        if v then
+            pcall(function() UIManager.SetCheckboxValue("aim_part_torso", false) end)
+            pcall(function() UIManager.SetCheckboxValue("aim_part_closest", false) end)
+        end
+    end)
+end); parent("aim_part_head")
+pcall(function()
+    UIManager.CreateCheckbox("aim_part_torso", "Torso", false, function(v)
+        if v then
+            pcall(function() UIManager.SetCheckboxValue("aim_part_head", false) end)
+            pcall(function() UIManager.SetCheckboxValue("aim_part_closest", false) end)
+        end
+    end)
+end); parent("aim_part_torso")
+pcall(function()
+    UIManager.CreateCheckbox("aim_part_closest", "Closest", false, function(v)
+        if v then
+            pcall(function() UIManager.SetCheckboxValue("aim_part_head", false) end)
+            pcall(function() UIManager.SetCheckboxValue("aim_part_torso", false) end)
+        end
+    end)
+end); parent("aim_part_closest")
 
-nsafe(function()
-    UIManager.CreateCheckbox("fn_naim_sticky", "Sticky Aim", true, function(v) NAIM.sticky = v and true or false end)
-end); naim_parent("fn_naim_sticky")
-nsafe(function()
-    UIManager.CreateCheckbox("fn_naim_pred", "Velocity Prediction", true, function(v) NAIM.prediction = v and true or false end)
-end); naim_parent("fn_naim_pred")
-nsafe(function()
-    UIManager.CreateCheckbox("fn_naim_drop", "Bullet Drop Prediction", false, function(v) NAIM.drop = v and true or false end)
-end); naim_parent("fn_naim_drop")
+pcall(function() UIManager.CreateSliderInt("aim_range", "Range", 50, 1200, 850) end); parent("aim_range")
+pcall(function() UIManager.CreateSliderInt("aim_fov", "FOV", 20, 500, 150) end); parent("aim_fov")
+pcall(function() UIManager.CreateSliderInt("aim_smooth", "Smooth", 1, 25, 6) end); parent("aim_smooth")
+pcall(function() UIManager.CreateCheckbox("aim_sticky", "Sticky Aim", true) end); parent("aim_sticky")
+pcall(function() UIManager.CreateCheckbox("aim_pred", "Velocity Prediction", true) end); parent("aim_pred")
+pcall(function() UIManager.CreateCheckbox("aim_drop", "Bullet Drop", true) end); parent("aim_drop")
+pcall(function() UIManager.CreateSliderInt("aim_lead", "Lead Scale %", 50, 200, 100) end); parent("aim_lead")
+pcall(function() UIManager.CreateSliderInt("aim_bulletspeed", "Bullet Speed override (0=auto)", 0, 2000, 0) end); parent("aim_bulletspeed")
+pcall(function() UIManager.CreateSliderInt("aim_gravity", "Gravity override (0=auto)", 0, 80, 0) end); parent("aim_gravity")
+pcall(function() UIManager.CreateSliderInt("aim_ping", "Ping ms (latency)", 0, 200, 50) end); parent("aim_ping")
+pcall(function() UIManager.CreateCheckbox("aim_use_accel", "Use Acceleration", true) end); parent("aim_use_accel")
+pcall(function() UIManager.CreateCheckbox("aim_quadratic", "Quadratic Intercept", true) end); parent("aim_quadratic")
+pcall(function() UIManager.CreateCheckbox("aim_human", "Humanize", false) end); parent("aim_human")
+pcall(function() UIManager.CreateCheckbox("aim_drawfov", "Draw FOV", true) end); parent("aim_drawfov")
+pcall(function() UIManager.CreateCheckbox("aim_team", "Team Check (players)", true) end); parent("aim_team")
+pcall(function() UIManager.CreateCheckbox("aim_mode_mouse", "Use write_mouse", true) end); parent("aim_mode_mouse")
+pcall(function() UIManager.CreateCheckbox("aim_mode_cursor", "Use MoveMouse", true) end); parent("aim_mode_cursor")
+pcall(function() UIManager.CreateCheckbox("aim_mode_cam", "Use camera matrix", true) end); parent("aim_mode_cam")
 
-local function naim_check(id, fb)
+local function chk(id, fb)
+    local v = nil
     if UIManager and UIManager.GetCheckboxValue then
-        local v = nsafe(function() return UIManager.GetCheckboxValue(id) end, nil)
-        if v ~= nil then return v == true end
+        local ok, r = pcall(function() return UIManager.GetCheckboxValue(id) end)
+        if ok then v = r end
     end
-    return fb and true or false
+    if v == nil then return fb == true end
+    return v == true
 end
-
-local function naim_slider(id, fb)
+local function sli(id, fb)
     if UIManager and UIManager.GetSliderIntValue then
-        local v = nsafe(function() return UIManager.GetSliderIntValue(id) end, nil)
-        if type(v) == "number" then return v end
+        local ok, r = pcall(function() return UIManager.GetSliderIntValue(id) end)
+        if ok and type(r) == "number" then return r end
     end
     return fb
 end
 
-local function naim_key_held()
-    -- CreateKeybind: IsKeybindPressed / GetKeybindValue
-    if UIManager and UIManager.IsKeybindPressed then
-        local v = nsafe(function() return UIManager.IsKeybindPressed("fn_naim_key") end, nil)
-        if v ~= nil then return v == true end
+local VKN = {
+    [0x01]="LMB",[0x02]="RMB",[0x04]="MMB",[0x05]="M4",[0x06]="M5",
+    [0x08]="BKSP",[0x09]="TAB",[0x0D]="ENTER",[0x10]="SHIFT",[0x11]="CTRL",[0x12]="ALT",
+    [0x1B]="ESC",[0x20]="SPACE",[0x45]="E",[0x58]="X",[0x43]="C",[0x56]="V",[0x51]="Q",
+    [0x46]="F",[0x47]="G",[0x54]="T",[0x52]="R",[0x59]="Y",[0x48]="H",
+}
+for i = 0, 25 do VKN[0x41 + i] = string.char(65 + i) end
+for i = 0, 9 do VKN[0x30 + i] = tostring(i) end
+for i = 0, 11 do VKN[0x70 + i] = "F" .. (i + 1) end
+
+local function vk_label(vk)
+    if not vk or vk == 0 then return "none" end
+    return VKN[vk] or ("VK"..tostring(vk))
+end
+
+local function set_key_txt()
+    local t = AIM.capture and "Custom Key: press key..." or ("Custom Key: " .. vk_label(AIM.vk))
+    pcall(function()
+        if UIManager.SetText then UIManager.SetText("aim_key_txt", t)
+        elseif UIManager.SetElementText then UIManager.SetElementText("aim_key_txt", t) end
+    end)
+end
+
+-- Capture: ignore mouse buttons always; after delay accept keyboard / side mouse
+local function poll_capture()
+    if not AIM.capture then return end
+    if not Windows or not Windows.IsKeyPressed then return end
+    if tick() < AIM.capture_until then return end
+    for vk = 0x08, 0xFE do
+        if vk == 0x01 then goto continue end -- never bind LMB via capture
+        local ok, down = pcall(function() return Windows.IsKeyPressed(vk) end)
+        if ok and down then
+            AIM.vk = vk
+            AIM.capture = false
+            set_key_txt()
+            if notify then notify("Aim key set: " .. vk_label(vk), "success") end
+            return
+        end
+        ::continue::
     end
-    if UIManager and UIManager.GetKeybindValue then
-        local vk = nsafe(function() return UIManager.GetKeybindValue("fn_naim_key") end, nil)
-        if type(vk) == "number" and vk > 0 and Windows and Windows.IsKeyPressed then
-            return nsafe(function() return Windows.IsKeyPressed(vk) end, false) == true
+end
+
+local function aim_key_held()
+    if AIM.capture then return false end
+    -- 1) Official keybind widget
+    if UIManager and UIManager.IsKeybindPressed then
+        local ok, held = pcall(function() return UIManager.IsKeybindPressed("aim_keybind") end)
+        if ok and held == true then return true end
+    end
+    -- 2) Custom VK from Set Aim Key
+    if AIM.vk and AIM.vk ~= 0 and Windows and Windows.IsKeyPressed then
+        local ok, held = pcall(function() return Windows.IsKeyPressed(AIM.vk) end)
+        if ok and held then return true end
+    end
+    -- 3) GetKeybindValue + IsKeyPressed
+    if UIManager and UIManager.GetKeybindValue and Windows and Windows.IsKeyPressed then
+        local ok, vk = pcall(function() return UIManager.GetKeybindValue("aim_keybind") end)
+        if ok and type(vk) == "number" and vk > 0 and vk ~= 1 then
+            local ok2, held = pcall(function() return Windows.IsKeyPressed(vk) end)
+            if ok2 and held then return true end
         end
     end
     return false
 end
 
-local function naim_kind_ok(kind)
-    if kind == "boris" then return naim_check("fn_naim_boris", true) end
-    if kind == "bruno" then return naim_check("fn_naim_bruno", true) end
-    if kind == "brutus" then return naim_check("fn_naim_brutus", true) end
-    return naim_check("fn_naim_mil", true) -- soldier
-end
-
-local function naim_center()
-    local d = nsafe(function() return rbx.screen_dim() end, nil)
-    if d and d.Width then return d.Width * 0.5, d.Height * 0.5 end
+local function center()
+    if rbx and rbx.screen_dim then
+        local ok, d = pcall(function() return rbx.screen_dim() end)
+        if ok and d and d.Width then return d.Width * 0.5, d.Height * 0.5 end
+    end
+    if Windows and Windows.GetRobloxClientSize then
+        local ok, s = pcall(function() return Windows.GetRobloxClientSize() end)
+        if ok and s and s.Width then return s.Width * 0.5, s.Height * 0.5 end
+    end
     return 960, 540
 end
 
-local function naim_bone_pos(e)
-    local bone = naim_slider("fn_naim_bone", 0)
-    -- 0 Head (якорь e.x/y/z уже около головы)
-    -- 1 Torso
-    -- 2 Closest to crosshair among head/torso/feet
-    local hx, hy, hz = e.x, e.y, e.z
-    local tx, ty, tz = e.fx or e.x, (e.fy or e.y) + 0.9, e.fz or e.z
-    local fx, fy, fz = e.fx or e.x, (e.fy or e.y) - 0.2, e.fz or e.z
+local function part_mode()
+    if chk("aim_part_closest", false) then return 2 end
+    if chk("aim_part_torso", false) then return 1 end
+    return 0
+end
 
-    if bone == 1 then
-        return tx, ty, tz
+local function v3(x, y, z)
+    if Vector3 then return Vector3(x, y, z) end
+    return { X = x, Y = y, Z = z, x = x, y = y, z = z }
+end
+
+local function w2s(x, y, z)
+    if aim and aim.world_to_screen then
+        local ok, s = pcall(function() return aim.world_to_screen(v3(x, y, z)) end)
+        if ok and s and s.visible ~= false then
+            local sx, sy = s.X or s.x, s.Y or s.y
+            if type(sx) == "number" then return sx, sy end
+        end
     end
-    if bone == 2 then
-        local cx, cy = naim_center()
-        local candidates = {
-            {hx, hy, hz},
-            {tx, ty, tz},
-            {fx, fy, fz},
-        }
-        local best, best_d = candidates[1], 1e9
-        for i = 1, #candidates do
-            local c = candidates[i]
-            local sx, sy = nw2s(c[1], c[2], c[3])
+    return nw2s(x, y, z)
+end
+
+local function npc_kind_ok(kind)
+    if kind == "boris" then return chk("aim_boris", true) end
+    if kind == "bruno" then return chk("aim_bruno", true) end
+    if kind == "brutus" then return chk("aim_brutus", true) end
+    return chk("aim_mil", true)
+end
+
+local function bone_from_xyz(hx, hy, hz, rx, ry, rz)
+    local mode = part_mode()
+    local tx, ty, tz = rx, ry + 0.6, rz
+    if mode == 1 then return tx, ty, tz, "Torso" end
+    if mode == 2 then
+        local cx, cy = center()
+        local best, bn, bd = {hx,hy,hz}, "Head", 1e18
+        for _, c in ipairs({{hx,hy,hz,"Head"},{tx,ty,tz,"Torso"},{rx,ry-1.2,rz,"Feet"}}) do
+            local sx, sy = w2s(c[1], c[2], c[3])
             if sx then
                 local d = (sx - cx) * (sx - cx) + (sy - cy) * (sy - cy)
-                if d < best_d then best_d = d; best = c end
+                if d < bd then bd = d; best = c; bn = c[4] end
             end
         end
-        return best[1], best[2], best[3]
+        return best[1], best[2], best[3], bn
     end
-    return hx, hy, hz
+    return hx, hy, hz, "Head"
 end
 
-local function naim_predict(e, x, y, z)
-    if not naim_check("fn_naim_pred", true) then return x, y, z end
-    local t = tick()
-    local prev = naim_prev[e.key]
-    naim_prev[e.key] = { x = e.x, y = e.y, z = e.z, t = t }
-    if not prev or not prev.t then return x, y, z end
-    local dt = t - prev.t
-    if dt <= 0.001 or dt > 0.4 then return x, y, z end
-    local vx = (e.x - prev.x) / dt
-    local vy = (e.y - prev.y) / dt
-    local vz = (e.z - prev.z) / dt
-    local sp2 = vx*vx + vy*vy + vz*vz
-    -- Infernal: discard teleport spikes > 500 studs/s
-    if sp2 > 250000 then return x, y, z end
-    local lead = 0.10
-    x = x + vx * lead
-    y = y + vy * lead
-    z = z + vz * lead
-    if naim_check("fn_naim_drop", false) then
-        -- простой drop: g~28, t~0.1
-        y = y + 0.5 * 28 * (lead * lead)
+local function weapon_stats()
+    local name = nil
+    if players and players.get_local then
+        local ok, me = pcall(function() return players.get_local() end)
+        if ok and me and me.tool and me.tool ~= "" then name = me.tool end
     end
-    return x, y, z
-end
-
-local function naim_pick(lx, ly, lz)
-    local cx, cy = naim_center()
-    local fov = naim_slider("fn_naim_fov", 150)
-    local range = naim_slider("fn_naim_range", 500)
-    local sticky = naim_check("fn_naim_sticky", true)
-
-    if sticky and naim_locked then
-        local e = npc_cache[naim_locked]
-        if e and e.status == "alive" and e.x and naim_kind_ok(e.kind) then
-            local dx = e.x - lx
-            local dy = e.y - ly
-            local dz = e.z - lz
-            local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-            if dist <= range then
-                local bx, by, bz = naim_bone_pos(e)
-                local sx, sy = nw2s(bx, by, bz)
-                if sx then
-                    local fd = math.sqrt((sx-cx)^2 + (sy-cy)^2)
-                    if fd <= fov * 1.5 then
-                        return e, bx, by, bz, dist
-                    end
-                end
-            end
+    if not name and rbx and rbx.local_tool then
+        local ok, t = pcall(function() return rbx.local_tool() end)
+        if ok and t then
+            local ok2, n = pcall(function() return t:get_name() end)
+            if ok2 then name = n end
         end
-        naim_locked = nil
     end
+    local st = (name and WEAPON[name]) or WEAPON.Default
+    local spd = sli("aim_bulletspeed", 0)
+    local grv = sli("aim_gravity", 0)
+    return {
+        speed = (spd > 0) and spd or (st.speed or 1000),
+        gravity = (grv > 0) and grv or (st.gravity or 18),
+        name = name or "Default",
+    }
+end
 
-    local best, best_fov, bx, by, bz, bdist = nil, fov, nil, nil, nil, nil
-    for i = 1, #npc_order do
-        local e = npc_cache[npc_order[i]]
-        if e and e.status == "alive" and e.x and naim_kind_ok(e.kind) then
-            local dx = e.x - lx
-            local dy = e.y - ly
-            local dz = e.z - lz
-            local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-            if dist <= range then
-                local px, py, pz = naim_bone_pos(e)
-                local sx, sy = nw2s(px, py, pz)
-                if sx then
-                    local fd = math.sqrt((sx-cx)^2 + (sy-cy)^2)
-                    if fd < best_fov then
-                        best_fov = fd
-                        best = e
-                        bx, by, bz = px, py, pz
-                        bdist = dist
-                    end
-                end
+--[[
+  Ballistic intercept (700-800m capable):
+  1) Sample TargetPosition / smoothed TargetVelocity / TargetAcceleration
+  2) Time = flight + ping + frame_dt
+  3) Quadratic intercept:
+       |P + V t - L| = S * t
+       (V·V - S^2) t^2 + 2(D·V) t + D·D = 0
+       D = TargetPos - LocalPos
+  4) PredictedPos = Pos + V*t + 0.5*A*t^2
+  5) Bullet drop: Y += 0.5 * g * t^2
+]]
+local function predict(key, x, y, z)
+    local st = weapon_stats()
+    local speed = math.max(80, st.speed or 1000)
+    local grav = st.gravity or 18
+    local now = tick()
+
+    -- ClientFrameTime
+    if AIM.last_frame_t > 0 then
+        local fdt = now - AIM.last_frame_t
+        if fdt > 0.001 and fdt < 0.2 then
+            AIM.frame_dt = AIM.frame_dt * 0.85 + fdt * 0.15
+        end
+    end
+    AIM.last_frame_t = now
+
+    local h = AIM.hist[key]
+    local rvx, rvy, rvz = 0, 0, 0
+    if h and h.t then
+        local dt = now - h.t
+        if dt > 0.001 and dt < 0.5 then
+            rvx = (x - h.x) / dt
+            rvy = (y - h.y) / dt
+            rvz = (z - h.z) / dt
+            local sp2 = rvx*rvx + rvy*rvy + rvz*rvz
+            if sp2 > 250000 then -- Fallen NPC pool teleport
+                rvx, rvy, rvz = 0, 0, 0
             end
         end
     end
-    if best and sticky then naim_locked = best.key end
-    return best, bx, by, bz, bdist
-end
 
-local function naim_aim(x, y, z)
-    local smooth = math.max(1, naim_slider("fn_naim_smooth", 5))
-    local pos = Vector3 and Vector3(x, y, z) or { X = x, Y = y, Z = z }
+    -- EMA velocity
+    local alpha_v = 0.30
+    local svx, svy, svz = rvx, rvy, rvz
+    if h and h.svx then
+        svx = h.svx + (rvx - h.svx) * alpha_v
+        svy = h.svy + (rvy - h.svy) * alpha_v
+        svz = h.svz + (rvz - h.svz) * alpha_v
+    end
 
-    -- 1) camera look_at (как Infernal camera.look_at)
-    if aim and aim.look_at_matrix and aim.set_camera_rotation and aim.get_camera_position then
-        local cam = nsafe(function() return aim.get_camera_position() end, nil)
-        if cam then
-            local target_m = nsafe(function() return aim.look_at_matrix(cam, pos) end, nil)
-            if target_m then
-                local cur = nsafe(function() return aim.get_camera_rotation() end, nil)
-                if cur and smooth > 1 then
-                    local t = 1 / smooth
-                    local m = {}
-                    for i = 1, 9 do
-                        m[i] = cur[i] + ((target_m[i] or 0) - (cur[i] or 0)) * t
-                    end
-                    nsafe(function() aim.set_camera_rotation(m) end)
+    -- Acceleration from velocity change (EMA)
+    local sax, say, saz = 0, 0, 0
+    if h and h.svx and h.t then
+        local dt = now - h.t
+        if dt > 0.001 and dt < 0.5 then
+            local rax = (svx - h.svx) / dt
+            local ray = (svy - h.svy) / dt
+            local raz = (svz - h.svz) / dt
+            local a2 = rax*rax + ray*ray + raz*raz
+            if a2 < 500000 then -- ignore insane accel spikes
+                local alpha_a = 0.25
+                if h.sax then
+                    sax = h.sax + (rax - h.sax) * alpha_a
+                    say = h.say + (ray - h.say) * alpha_a
+                    saz = h.saz + (raz - h.saz) * alpha_a
                 else
-                    nsafe(function() aim.set_camera_rotation(target_m) end)
+                    sax, say, saz = rax, ray, raz
                 end
-                return
             end
         end
     end
 
-    -- 2) write_mouse fallback
-    if aim and aim.world_to_screen and aim.write_mouse then
-        local s = nsafe(function() return aim.world_to_screen(pos) end, nil)
-        if s and s.visible ~= false then
-            nsafe(function() aim.write_mouse(s) end)
-            return
+    AIM.hist[key] = {
+        x = x, y = y, z = z, t = now,
+        svx = svx, svy = svy, svz = svz,
+        sax = sax, say = say, saz = saz,
+    }
+
+    local want_pred = chk("aim_pred", true)
+    local want_drop = chk("aim_drop", true)
+    if not want_pred and not want_drop then
+        return x, y, z
+    end
+
+    local lx, ly, lz = nlocal_xyz()
+    if not lx then return x, y, z end
+
+    local lead = sli("aim_lead", 100) / 100
+    local vx = svx * lead
+    local vy = svy * lead
+    local vz = svz * lead
+    local use_accel = chk("aim_use_accel", true)
+    local ax = use_accel and (sax * lead) or 0
+    local ay = use_accel and (say * lead) or 0
+    local az = use_accel and (saz * lead) or 0
+
+    -- Latency: Ping + frame time (one-way ~ ping_ms/2000 from RTT slider as ms RTT)
+    local ping_ms = sli("aim_ping", 50)
+    local ping_s = math.max(0, ping_ms) / 1000 -- treat slider as one-way ms for simplicity
+    local frame_s = AIM.frame_dt
+    if frame_s < 0.005 then frame_s = 0.005 end
+    if frame_s > 0.1 then frame_s = 0.1 end
+
+    local dx0 = x - lx
+    local dy0 = y - ly
+    local dz0 = z - lz
+    local dist0 = math.sqrt(dx0*dx0 + dy0*dy0 + dz0*dz0)
+
+    local t_flight = 0
+    local use_quad = chk("aim_quadratic", true)
+
+    if want_pred and use_quad then
+        -- Quadratic: (V·V - S^2) t^2 + 2(D·V) t + D·D = 0
+        -- D = target - local, |D + V t| = S t
+        local dvx, dvy, dvz = vx, vy, vz
+        local d2 = dx0*dx0 + dy0*dy0 + dz0*dz0
+        local a = (dvx*dvx + dvy*dvy + dvz*dvz) - (speed * speed)
+        local b = 2 * (dx0*dvx + dy0*dvy + dz0*dvz)
+        local c = d2
+        local t_hit = nil
+
+        if math.abs(a) < 1e-6 then
+            -- linear fallback: 2 (D·V) t + D·D ≈ 0  or  t = dist/speed
+            if math.abs(b) > 1e-6 then
+                local t1 = -c / b
+                if t1 > 0 then t_hit = t1 end
+            end
+            if not t_hit then t_hit = dist0 / speed end
+        else
+            local disc = b*b - 4*a*c
+            if disc >= 0 then
+                local sd = math.sqrt(disc)
+                local t1 = (-b - sd) / (2 * a)
+                local t2 = (-b + sd) / (2 * a)
+                -- pick smallest positive root
+                if t1 > 0 and t2 > 0 then
+                    t_hit = math.min(t1, t2)
+                elseif t1 > 0 then
+                    t_hit = t1
+                elseif t2 > 0 then
+                    t_hit = t2
+                end
+            end
+            if not t_hit then
+                t_hit = dist0 / speed
+            end
+        end
+        t_flight = t_hit
+    else
+        -- iterative linear refine
+        local px, py, pz = x, y, z
+        for _ = 1, 5 do
+            local dx = px - lx
+            local dy = py - ly
+            local dz = pz - lz
+            local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+            t_flight = dist / speed
+            if t_flight > 3.0 then t_flight = 3.0 end
+            if want_pred then
+                px = x + vx * t_flight + 0.5 * ax * t_flight * t_flight
+                py = y + vy * t_flight + 0.5 * ay * t_flight * t_flight
+                pz = z + vz * t_flight + 0.5 * az * t_flight * t_flight
+            else
+                break
+            end
         end
     end
 
-    -- 3) physical cursor
-    local sx, sy = nw2s(x, y, z)
-    if sx and Windows and Windows.GetMousePos and Windows.MoveMouse then
-        local mp = nsafe(function() return Windows.GetMousePos() end, nil)
-        if mp then
-            local nx = mp.X + (sx - mp.X) / smooth
-            local ny = mp.Y + (sy - mp.Y) / smooth
-            nsafe(function() Windows.MoveMouse(nx, ny) end)
+    if t_flight < 0 then t_flight = 0 end
+    if t_flight > 3.0 then t_flight = 3.0 end -- hard cap ~800m+ slow proj
+
+    -- Total time: flight + latency
+    local t = t_flight + ping_s + frame_s
+    if t > 3.2 then t = 3.2 end
+
+    local px, py, pz = x, y, z
+    if want_pred then
+        -- Pos + V*t + 0.5*A*t^2
+        px = x + vx * t + 0.5 * ax * t * t
+        py = y + vy * t + 0.5 * ay * t * t
+        pz = z + vz * t + 0.5 * az * t * t
+    end
+
+    -- Bullet drop compensation (aim higher)
+    if want_drop and t_flight > 0.001 then
+        -- drop uses flight time of the bullet itself (not extra ping on gravity of target)
+        py = py + 0.5 * grav * t_flight * t_flight
+    end
+
+    return px, py, pz
+end
+
+local function humanize(id, x, y, z, bone)
+    if not chk("aim_human", false) then return x, y, z, 1 end
+    local hz = AIM.hz
+    local now = tick() * 1000
+    if hz.id ~= id then
+        hz.id = id
+        hz.until_ms = now + 60 + math.random() * 100
+        hz.mul = 0.85 + math.random() * 0.45
+        hz.next = 0
+    end
+    if now < hz.until_ms then return nil end
+    if now >= hz.next then
+        hz.next = now + 200 + math.random() * 350
+        local r = (bone == "Head") and 0.25 or 0.5
+        hz.ox = (math.random() * 2 - 1) * r
+        hz.oy = (math.random() * 2 - 1) * r * 0.7
+        hz.oz = (math.random() * 2 - 1) * r
+    end
+    return x + hz.ox, y + hz.oy, z + hz.oz, hz.mul
+end
+
+local function collect_candidates(lx, ly, lz, fov, range)
+    local cx, cy = center()
+    local list = {}
+
+    if chk("aim_players", true) and players and players.get_all then
+        local ok, all = pcall(function() return players.get_all() end)
+        if ok and all then
+            for _, p in ipairs(all) do
+                if not p.is_self and (not chk("aim_team", true) or not p.is_teammate) then
+                    if (p.health or 1) > 0 then
+                        local head = p.head_pos or p.position
+                        local root = p.position or p.head_pos
+                        if head then
+                            local hx, hy, hz = head.X or head.x, head.Y or head.y, head.Z or head.z
+                            local rx = (root and (root.X or root.x)) or hx
+                            local ry = (root and (root.Y or root.y)) or hy
+                            local rz = (root and (root.Z or root.z)) or hz
+                            if type(hx) == "number" then
+                                local dist = p.distance or math.sqrt((hx-lx)^2+(hy-ly)^2+(hz-lz)^2)
+                                if dist <= range then
+                                    local bx, by, bz, bn = bone_from_xyz(hx, hy, hz, rx, ry, rz)
+                                    local sx, sy = w2s(bx, by, bz)
+                                    if sx then
+                                        local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
+                                        if fd <= fov then
+                                            list[#list+1] = {
+                                                type = "player",
+                                                id = "p:" .. tostring(p.address or p.name),
+                                                addr = p.address,
+                                                fd = fd, dist = dist,
+                                                x = bx, y = by, z = bz, bone = bn,
+                                            }
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if chk("aim_npcs", true) then
+        for i = 1, #npc_order do
+            local e = npc_cache[npc_order[i]]
+            if e and e.status == "alive" and e.x and npc_kind_ok(e.kind) then
+                local dist = math.sqrt((e.x-lx)^2+(e.y-ly)^2+(e.z-lz)^2)
+                if dist <= range then
+                    local bx, by, bz, bn = bone_from_xyz(e.x, e.y, e.z, e.fx or e.x, e.fy or e.y, e.fz or e.z)
+                    local sx, sy = w2s(bx, by, bz)
+                    if sx then
+                        local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
+                        if fd <= fov then
+                            list[#list+1] = {
+                                type = "npc",
+                                id = e.key,
+                                key = e.key,
+                                fd = fd, dist = dist,
+                                x = bx, y = by, z = bz, bone = bn,
+                            }
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(list, function(a, b) return a.fd < b.fd end)
+    return list
+end
+
+local function pick(lx, ly, lz)
+    local fov = sli("aim_fov", 150)
+    local range = sli("aim_range", 500)
+    local sticky = chk("aim_sticky", true)
+    local cx, cy = center()
+
+    if sticky and AIM.locked then
+        local L = AIM.locked
+        if L.type == "player" and L.addr and players and players.get_all then
+            local ok, all = pcall(function() return players.get_all() end)
+            if ok and all then
+                for _, p in ipairs(all) do
+                    if p.address == L.addr and not p.is_self then
+                        local head = p.head_pos or p.position
+                        local root = p.position or head
+                        if head then
+                            local hx, hy, hz = head.X or head.x, head.Y or head.y, head.Z or head.z
+                            local rx = root.X or root.x or hx
+                            local ry = root.Y or root.y or hy
+                            local rz = root.Z or root.z or hz
+                            local dist = p.distance or math.sqrt((hx-lx)^2+(hy-ly)^2+(hz-lz)^2)
+                            if dist <= range then
+                                local bx, by, bz, bn = bone_from_xyz(hx, hy, hz, rx, ry, rz)
+                                local sx, sy = w2s(bx, by, bz)
+                                if sx then
+                                    local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
+                                    if fd <= fov * 1.4 then
+                                        return { type="player", id=L.id or ("p:"..L.addr), addr=L.addr, x=bx,y=by,z=bz, bone=bn, fd=fd, dist=dist }
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        elseif L.type == "npc" and L.key then
+            local e = npc_cache[L.key]
+            if e and e.status == "alive" and e.x and npc_kind_ok(e.kind) then
+                local dist = math.sqrt((e.x-lx)^2+(e.y-ly)^2+(e.z-lz)^2)
+                if dist <= range then
+                    local bx, by, bz, bn = bone_from_xyz(e.x, e.y, e.z, e.fx or e.x, e.fy or e.y, e.fz or e.z)
+                    local sx, sy = w2s(bx, by, bz)
+                    if sx then
+                        local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
+                        if fd <= fov * 1.4 then
+                            return { type="npc", id=L.key, key=L.key, x=bx,y=by,z=bz, bone=bn, fd=fd, dist=dist }
+                        end
+                    end
+                end
+            end
+        end
+        AIM.locked = nil
+        AIM.hz.id = nil
+    end
+
+    local list = collect_candidates(lx, ly, lz, fov, range)
+    local best = list[1]
+    if best and sticky then
+        if best.type == "player" then
+            AIM.locked = { type = "player", addr = best.addr, id = best.id }
+        else
+            AIM.locked = { type = "npc", key = best.key or best.id, id = best.id }
+        end
+    end
+    return best
+end
+
+-- Apply aim using official Blueberry paths (recipes 1 + 9)
+local function apply_aim(x, y, z, smooth)
+    smooth = math.max(1, smooth or 6)
+    local sx, sy = w2s(x, y, z)
+    if not sx then return false end
+
+    local did = false
+
+    -- Recipe 9: physical cursor (camera turns)
+    if chk("aim_mode_cursor", true) and Windows and Windows.GetMousePos and Windows.MoveMouse then
+        local ok, mp = pcall(function() return Windows.GetMousePos() end)
+        if ok and mp and mp.X then
+            local t = 1 / smooth
+            local nx = mp.X + (sx - mp.X) * t
+            local ny = mp.Y + (sy - mp.Y) * t
+            pcall(function() Windows.MoveMouse(nx, ny) end)
+            did = true
+        end
+    end
+
+    -- Recipe 1: write_mouse into MouseService
+    if chk("aim_mode_mouse", true) and aim and aim.write_mouse then
+        pcall(function() aim.write_mouse({ X = sx, Y = sy }) end)
+        did = true
+    end
+
+    -- Camera matrix fallback
+    if chk("aim_mode_cam", true) and aim and aim.look_at_matrix and aim.set_camera_rotation and aim.get_camera_position then
+        local ok, cpos = pcall(function() return aim.get_camera_position() end)
+        if ok and cpos then
+            local ok2, m = pcall(function() return aim.look_at_matrix(cpos, v3(x, y, z)) end)
+            if ok2 and m then
+                if smooth <= 2 then
+                    pcall(function() aim.set_camera_rotation(m) end)
+                else
+                    local ok3, cur = pcall(function() return aim.get_camera_rotation() end)
+                    if ok3 and cur then
+                        local t = 1 / smooth
+                        local out = {}
+                        for i = 1, 9 do out[i] = (cur[i] or 0) + ((m[i] or 0) - (cur[i] or 0)) * t end
+                        pcall(function() aim.set_camera_rotation(out) end)
+                    else
+                        pcall(function() aim.set_camera_rotation(m) end)
+                    end
+                end
+                did = true
+            end
+        end
+    end
+
+    return did
+end
+
+local function draw_fov()
+    if not chk("aim_drawfov", true) then return end
+    if not chk("aim_en", false) then return end
+    local cx, cy = center()
+    local fov = sli("aim_fov", 150)
+    if Drawing.DrawCircle then
+        pcall(function() Drawing.DrawCircle(cx, cy, fov, 1, 1, 1, 0.55, 1.2) end)
+        return
+    end
+    if Drawing.DrawLine then
+        local n, px, py = 48, nil, nil
+        for i = 0, n do
+            local a = (i / n) * math.pi * 2
+            local x = cx + math.cos(a) * fov
+            local y = cy + math.sin(a) * fov
+            if px then pcall(function() Drawing.DrawLine(px, py, x, y, 1, 1, 1, 0.45, 1) end) end
+            px, py = x, y
         end
     end
 end
 
 hooks.on_render(function()
-    if not naim_check("fn_naim_en", false) then
-        naim_locked = nil
+    poll_capture()
+    set_key_txt()
+    draw_fov()
+
+    if not chk("aim_en", false) then
+        AIM.locked = nil
         return
     end
-
-    -- аим только когда зажат Aim Key (как в Infernal hold)
-    if not naim_key_held() then
-        naim_locked = nil
+    if not aim_key_held() then
+        AIM.locked = nil
+        AIM.hz.id = nil
         return
     end
 
     local lx, ly, lz = nlocal_xyz()
     if not lx then return end
 
-    local e, bx, by, bz = naim_pick(lx, ly, lz)
-    if not e or not bx then return end
+    local t = pick(lx, ly, lz)
+    if not t then return end
 
-    bx, by, bz = naim_predict(e, bx, by, bz)
-    naim_aim(bx, by, bz)
+    local x, y, z = predict(t.id, t.x, t.y, t.z)
+    local hx, hy, hz, mul = humanize(t.id, x, y, z, t.bone or "Head")
+    if not hx then return end
+
+    local smooth = sli("aim_smooth", 6)
+    if mul then smooth = math.max(2, smooth * mul) end
+    apply_aim(hx, hy, hz, smooth)
 end)
 
-_G.FallenNPC_Cache = npc_cache
-_G.FallenNPC_Order = npc_order
-
-if notify then notify("Fallen ALL-IN-ONE + NPC Aimbot (keybind)", "success") end
+_G.FallenAim = AIM
+if notify then notify("Aimbot ready: keybind + Players/NPCs (Blueberry aim API)", "success") end
 end
+en
