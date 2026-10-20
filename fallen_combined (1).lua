@@ -3287,19 +3287,25 @@ local function nrow(id, label, default, key, cid, col)
     ncheck(id, label, default, key)
     local r,g,b,a = col[1], col[2], col[3], col[4] or 1
     -- unique cid already separates Mil/Boss; short label + SameLine = square next to checkbox
-    nsafe(function() UIManager.CreateColorPicker(cid, " ", r,g,b,a) end)
+    nsafe(function() UIManager.CreateColorPicker(cid, tostring(cid):sub(-6), r,g,b,a) end)
     nparent(cid)
     nsame(cid)
 end
+-- legacy readers (ndraw uses nui_* live); kept with correct API names
 local function nread_color(id, dest)
-    if UIManager and UIManager.GetColorPicker then
-        local r,g,b,a = nsafe(function() return UIManager.GetColorPicker(id) end)
-        if type(r) == "number" then dest[1],dest[2],dest[3],dest[4]=r,g or 1,b or 1,a or 1 end
+    if UIManager and UIManager.GetColorPickerValue then
+        local c = nsafe(function() return UIManager.GetColorPickerValue(id) end, nil)
+        if c then
+            dest[1] = c.r or c.R or c[1] or dest[1]
+            dest[2] = c.g or c.G or c[2] or dest[2]
+            dest[3] = c.b or c.B or c[3] or dest[3]
+            dest[4] = c.a or c.A or c[4] or dest[4] or 1
+        end
     end
 end
 local function nread_slider(id, key)
-    if UIManager and UIManager.GetSliderInt then
-        local v = nsafe(function() return UIManager.GetSliderInt(id) end)
+    if UIManager and UIManager.GetSliderIntValue then
+        local v = nsafe(function() return UIManager.GetSliderIntValue(id) end, nil)
         if type(v) == "number" then NPC_CFG[key] = v end
     end
 end
@@ -3572,8 +3578,11 @@ local AIM = {
     last_frame_t = 0,
     frame_dt = 1/60,
     ping_s = 0.05,
-    pred_sx = nil, -- visualize predicted aim point
+    pred_sx = nil,
     pred_sy = nil,
+    last_wep = "Default",
+    last_speed = 1000,
+    last_grav = 18,
 }
 
 -- Fallen ballistic approx (studs/s, gravity scale). Tuned for long-range lead.
@@ -3707,7 +3716,7 @@ pcall(function() UIManager.CreateSliderInt("aim_pred_y", "Prediction Y", 1000, 2
 pcall(function() UIManager.CreateCheckbox("aim_drop", "Bullet Drop", true) end); parent("aim_drop")
 pcall(function() UIManager.CreateSliderInt("aim_bulletspeed", "Bullet Speed override (0=auto)", 0, 2000, 0) end); parent("aim_bulletspeed")
 pcall(function() UIManager.CreateSliderInt("aim_gravity", "Gravity override (0=auto)", 0, 80, 0) end); parent("aim_gravity")
-pcall(function() UIManager.CreateSliderInt("aim_ping", "Ping ms (latency)", 0, 200, 50) end); parent("aim_ping")
+pcall(function() UIManager.CreateSliderInt("aim_ping", "Ping ms (0=auto EMA)", 0, 200, 50) end); parent("aim_ping")
 pcall(function() UIManager.CreateCheckbox("aim_use_accel", "Use Acceleration", true) end); parent("aim_use_accel")
 pcall(function() UIManager.CreateCheckbox("aim_quadratic", "Quadratic Intercept", true) end); parent("aim_quadratic")
 pcall(function() UIManager.CreateCheckbox("aim_human", "Humanize", false) end); parent("aim_human")
@@ -3928,27 +3937,113 @@ local function bone_from_xyz(hx, hy, hz, rx, ry, rz)
     return hx, hy, hz, "Head"
 end
 
-local function weapon_stats()
+-- Fuzzy match weapon name -> WEAPON table
+local function resolve_weapon_name(raw)
+    if not raw or raw == "" then return nil end
+    if WEAPON[raw] then return raw end
+    -- case-insensitive exact
+    local low = string.lower(raw)
+    for k, _ in pairs(WEAPON) do
+        if string.lower(k) == low then return k end
+    end
+    -- substring (e.g. "Military M4A1" in longer string)
+    for k, _ in pairs(WEAPON) do
+        if k ~= "Default" and (low:find(string.lower(k), 1, true) or string.lower(k):find(low, 1, true)) then
+            return k
+        end
+    end
+    -- common aliases
+    local aliases = {
+        ["m4"] = "Military M4A1", ["m4a1"] = "Military M4A1",
+        ["barret"] = "Military Barrett", ["barrett"] = "Military Barrett",
+        ["ak"] = "Salvaged AK47", ["ak47"] = "Salvaged AK47",
+        ["mp7"] = "Military MP7", ["pkm"] = "Military PKM",
+        ["usp"] = "Military USP", ["m39"] = "Military M39",
+        ["aa12"] = "Military AA12", ["bruno"] = "Bruno's M4A1",
+    }
+    if aliases[low] then return aliases[low] end
+    return nil
+end
+
+local function detect_held_weapon()
     local name = nil
+    -- 1) players.get_local().tool
     if players and players.get_local then
         local ok, me = pcall(function() return players.get_local() end)
-        if ok and me and me.tool and me.tool ~= "" then name = me.tool end
+        if ok and me then
+            if me.tool and me.tool ~= "" then name = me.tool end
+            -- some builds put tool on character
+            if not name and me.raw and me.raw.tool then name = me.raw.tool end
+        end
     end
+    -- 2) rbx.local_tool()
     if not name and rbx and rbx.local_tool then
         local ok, t = pcall(function() return rbx.local_tool() end)
         if ok and t then
             local ok2, n = pcall(function() return t:get_name() end)
-            if ok2 then name = n end
+            if ok2 and n and n ~= "" then name = n end
         end
     end
+    -- 3) GetCurrentTool global
+    if not name and type(GetCurrentTool) == "function" then
+        local ok, t = pcall(GetCurrentTool)
+        if ok and t then
+            if type(t) == "string" then name = t
+            elseif type(t) == "table" and t.Name then name = t.Name
+            elseif type(t) == "userdata" or type(t) == "table" then
+                local ok2, n = pcall(function() return t:get_name() end)
+                if ok2 then name = n end
+            end
+        end
+    end
+    return resolve_weapon_name(name) or name
+end
+
+-- EMA of observed frame time used as part of latency
+local PING = { ema_ms = 50, last_t = 0 }
+
+local function update_ping_ema()
+    local now = tick()
+    if PING.last_t > 0 then
+        local dt = (now - PING.last_t) * 1000
+        if dt > 1 and dt < 200 then
+            PING.ema_ms = PING.ema_ms * 0.9 + dt * 0.1
+        end
+    end
+    PING.last_t = now
+end
+
+local function weapon_stats()
+    update_ping_ema()
+    local name = detect_held_weapon()
     local st = (name and WEAPON[name]) or WEAPON.Default
-    local spd = sli("aim_bulletspeed", 0)
-    local grv = sli("aim_gravity", 0)
-    return {
-        speed = (spd > 0) and spd or (st.speed or 1000),
-        gravity = (grv > 0) and grv or (st.gravity or 18),
-        name = name or "Default",
-    }
+    local spd_ov = sli("aim_bulletspeed", 0)
+    local grv_ov = sli("aim_gravity", 0)
+    local speed = (spd_ov > 0) and spd_ov or (st.speed or 1000)
+    local grav = (grv_ov > 0) and grv_ov or (st.gravity or 18)
+    -- clamp sane ballistics
+    if speed < 80 then speed = 80 end
+    if speed > 3000 then speed = 3000 end
+    if grav < 0 then grav = 0 end
+    if grav > 120 then grav = 120 end
+    AIM.last_wep = name or "Default"
+    AIM.last_speed = speed
+    AIM.last_grav = grav
+    return { speed = speed, gravity = grav, name = name or "Default" }
+end
+
+local function latency_seconds()
+    -- Slider = one-way delay ms; if 0 → use EMA frame-ish fallback
+    local ping_ms = sli("aim_ping", 50)
+    if ping_ms <= 0 then
+        ping_ms = math.max(10, math.min(120, PING.ema_ms))
+    end
+    local ping_s = ping_ms / 1000
+    local frame_s = AIM.frame_dt or (1/60)
+    if frame_s < 0.004 then frame_s = 0.004 end
+    if frame_s > 0.08 then frame_s = 0.08 end
+    -- half-frame: shot is mid-frame on average
+    return ping_s + frame_s * 0.5, ping_ms, frame_s
 end
 
 --[[
@@ -4047,16 +4142,12 @@ local function predict(key, x, y, z)
     local vy = svy * py_s
     local vz = svz * px_s  -- lateral Z uses X scale
     local use_accel = chk("aim_use_accel", true)
-    local ax = use_accel and (sax * lead) or 0
-    local ay = use_accel and (say * lead) or 0
-    local az = use_accel and (saz * lead) or 0
+    local ax = use_accel and (sax * px_s) or 0
+    local ay = use_accel and (say * py_s) or 0
+    local az = use_accel and (saz * px_s) or 0
 
-    -- Latency: Ping + frame time (one-way ~ ping_ms/2000 from RTT slider as ms RTT)
-    local ping_ms = sli("aim_ping", 50)
-    local ping_s = math.max(0, ping_ms) / 1000 -- treat slider as one-way ms for simplicity
-    local frame_s = AIM.frame_dt
-    if frame_s < 0.005 then frame_s = 0.005 end
-    if frame_s > 0.1 then frame_s = 0.1 end
+    -- Latency from slider + frame EMA
+    local ping_s, ping_ms, frame_s = latency_seconds()
 
     local dx0 = x - lx
     local dy0 = y - ly
@@ -4329,22 +4420,39 @@ local function apply_aim(x, y, z, smooth)
     if not use_cam and not use_mouse then use_mouse = true end
 
     -- ===== MOUSE AIM =====
+    -- w2s / aim.world_to_screen = game client pixels; GetMousePos = screen pixels.
+    -- Use one space only: prefer aim.move_mouse (client) or MoveMouse with screen delta.
     if use_mouse then
         local sx, sy = w2s(x, y, z)
         if not sx then return false end
-        if not (Windows and Windows.GetMousePos and Windows.MoveMouse) then return false end
-        local ok, mp = pcall(function() return Windows.GetMousePos() end)
-        if not ok or not mp or not mp.X then return false end
         local t = 1 / smooth
-        local nx = mp.X + (sx - mp.X) * t
-        local ny = mp.Y + (sy - mp.Y) * t
-        -- Prefer client-area coords if available
-        if Windows.MoveMouseInRoblox then
-            pcall(function() Windows.MoveMouseInRoblox(nx, ny) end)
-        else
-            pcall(function() Windows.MoveMouse(nx, ny) end)
+
+        -- 1) Blueberry aim.move_mouse (expects client/screen pos from world_to_screen)
+        if aim and aim.move_mouse then
+            local ok, mp = pcall(function()
+                if Windows and Windows.GetMousePos then return Windows.GetMousePos() end
+            end)
+            if ok and mp and mp.X then
+                pcall(function()
+                    aim.move_mouse({ X = mp.X + (sx - mp.X) * t, Y = mp.Y + (sy - mp.Y) * t })
+                end)
+            else
+                pcall(function() aim.move_mouse({ X = sx, Y = sy }) end)
+            end
+            return true
         end
-        return true
+
+        -- 2) Windows.MoveMouse — same coordinate space as GetMousePos (screen)
+        if Windows and Windows.GetMousePos and Windows.MoveMouse then
+            local ok, mp = pcall(function() return Windows.GetMousePos() end)
+            if ok and mp and mp.X then
+                pcall(function()
+                    Windows.MoveMouse(mp.X + (sx - mp.X) * t, mp.Y + (sy - mp.Y) * t)
+                end)
+                return true
+            end
+        end
+        return false
     end
 
     -- ===== CAMERA AIM =====
@@ -4441,6 +4549,10 @@ hooks.on_render(function()
     if Drawing and Drawing.DrawText then
         pcall(function()
             Drawing.DrawText(12, 40, p_debug .. " | npc:" .. tostring(#npc_order), 0.7, 0.9, 0.7, 0.85)
+            local wep = AIM.last_wep or "?"
+            local spd = AIM.last_speed or 0
+            local pg = sli("aim_ping", 50)
+            Drawing.DrawText(12, 54, string.format("wep:%s spd:%.0f ping:%dms", tostring(wep), spd, pg), 0.7, 0.85, 1, 0.85)
         end)
     end
 
