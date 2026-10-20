@@ -3583,6 +3583,8 @@ local AIM = {
     last_wep = "Default",
     last_speed = 1000,
     last_grav = 18,
+    last_drop = 0,
+    last_tflight = 0,
 }
 
 -- Fallen ballistic approx (studs/s, gravity scale). Tuned for long-range lead.
@@ -3708,14 +3710,25 @@ pcall(function() UIManager.CreateSliderInt("aim_fov", "FOV", 20, 500, 150) end);
 pcall(function() UIManager.CreateSliderInt("aim_smooth", "Smooth", 1, 25, 6) end); parent("aim_smooth")
 pcall(function() UIManager.CreateCheckbox("aim_sticky", "Sticky Aim", true) end); parent("aim_sticky")
 pcall(function() UIManager.CreateText("aim_pred_h", "Prediction") end); parent("aim_pred_h")
-pcall(function() UIManager.CreateCheckbox("aim_pred", "Enabled", true) end); parent("aim_pred")
+pcall(function()
+    UIManager.CreateCheckbox("aim_pred", "Enabled", true, function(v)
+        AIM.pred_enabled = v and true or false
+    end)
+end); parent("aim_pred")
+AIM.pred_enabled = true
 pcall(function() UIManager.CreateCheckbox("aim_pred_vis", "Visualize Prediction", false) end); parent("aim_pred_vis")
 -- Custom prediction strength 1000..20000 (1000 = 1.0x, 20000 = 20.0x)
 pcall(function() UIManager.CreateSliderInt("aim_pred_x", "Prediction X", 1000, 20000, 1000) end); parent("aim_pred_x")
 pcall(function() UIManager.CreateSliderInt("aim_pred_y", "Prediction Y", 1000, 20000, 1000) end); parent("aim_pred_y")
-pcall(function() UIManager.CreateCheckbox("aim_drop", "Bullet Drop", true) end); parent("aim_drop")
+pcall(function()
+    UIManager.CreateCheckbox("aim_drop", "Bullet Drop", true, function(v)
+        AIM.drop_enabled = v and true or false
+    end)
+end); parent("aim_drop")
+AIM.drop_enabled = true
 pcall(function() UIManager.CreateSliderInt("aim_bulletspeed", "Bullet Speed override (0=auto)", 0, 2000, 0) end); parent("aim_bulletspeed")
 pcall(function() UIManager.CreateSliderInt("aim_gravity", "Gravity override (0=auto)", 0, 80, 0) end); parent("aim_gravity")
+pcall(function() UIManager.CreateSliderInt("aim_drop_scale", "Drop Scale %", 0, 200, 100) end); parent("aim_drop_scale")
 pcall(function() UIManager.CreateSliderInt("aim_ping", "Ping ms (0=auto EMA)", 0, 200, 50) end); parent("aim_ping")
 pcall(function() UIManager.CreateCheckbox("aim_use_accel", "Use Acceleration", true) end); parent("aim_use_accel")
 pcall(function() UIManager.CreateCheckbox("aim_quadratic", "Quadratic Intercept", true) end); parent("aim_quadratic")
@@ -3936,23 +3949,57 @@ local function npc_kind_ok(kind)
     return chk("aim_mil", true)
 end
 
-local function bone_from_xyz(hx, hy, hz, rx, ry, rz)
+-- Closest bone: hysteresis + stick while same target (stops camera thrash)
+local function bone_from_xyz(hx, hy, hz, rx, ry, rz, stick_id)
     local mode = part_mode()
     local tx, ty, tz = rx, ry + 0.6, rz
-    if mode == 1 then return tx, ty, tz, "Torso" end
-    if mode == 2 then
-        local cx, cy = center()
-        local best, bn, bd = {hx,hy,hz}, "Head", 1e18
-        for _, c in ipairs({{hx,hy,hz,"Head"},{tx,ty,tz,"Torso"},{rx,ry-1.2,rz,"Feet"}}) do
-            local sx, sy = w2s(c[1], c[2], c[3])
-            if sx then
-                local d = (sx - cx) * (sx - cx) + (sy - cy) * (sy - cy)
-                if d < bd then bd = d; best = c; bn = c[4] end
+    if mode == 1 then
+        AIM.bone_lock = nil
+        return tx, ty, tz, "Torso"
+    end
+    if mode ~= 2 then
+        AIM.bone_lock = nil
+        return hx, hy, hz, "Head"
+    end
+
+    local candidates = {
+        {hx, hy, hz, "Head"},
+        {tx, ty, tz, "Torso"},
+        {rx, ry - 1.2, rz, "Feet"},
+    }
+    -- sticky: keep same bone name while locked on target
+    if stick_id and AIM.bone_lock and AIM.bone_lock.id == stick_id and AIM.bone_lock.name then
+        for _, c in ipairs(candidates) do
+            if c[4] == AIM.bone_lock.name then
+                return c[1], c[2], c[3], c[4]
             end
         end
-        return best[1], best[2], best[3], bn
     end
-    return hx, hy, hz, "Head"
+
+    local cx, cy = center()
+    local best, bn, bd = candidates[1], "Head", 1e18
+    for _, c in ipairs(candidates) do
+        local sx, sy = w2s(c[1], c[2], c[3])
+        if sx then
+            local d = (sx - cx) * (sx - cx) + (sy - cy) * (sy - cy)
+            if d < bd then bd = d; best = c; bn = c[4] end
+        end
+    end
+    -- hysteresis vs previous bone on same target
+    if stick_id and AIM.bone_lock and AIM.bone_lock.id == stick_id and AIM.bone_lock.d then
+        if bd > AIM.bone_lock.d * 0.72 then
+            -- not enough better — keep old bone
+            for _, c in ipairs(candidates) do
+                if c[4] == AIM.bone_lock.name then
+                    return c[1], c[2], c[3], c[4]
+                end
+            end
+        end
+    end
+    if stick_id then
+        AIM.bone_lock = { id = stick_id, name = bn, d = bd }
+    end
+    return best[1], best[2], best[3], bn
 end
 
 -- Fuzzy match weapon name -> WEAPON table
@@ -4075,6 +4122,27 @@ end
   4) PredictedPos = Pos + V*t + 0.5*A*t^2
   5) Bullet drop: Y += 0.5 * g * t^2
 ]]
+-- Bullet drop compensation:
+-- Aim HIGHER so projectile falls onto target.
+-- t = distance / bulletSpeed (use 3D dist; clamp)
+-- dy = 0.5 * g * t^2 * (DropScale/100)
+-- g from weapon table or Gravity override (studs/s^2 style scale for Fallen)
+local function bullet_drop_dy(dist, speed, grav)
+    if not dist or dist < 1 then return 0 end
+    speed = math.max(80, speed or 1000)
+    grav = grav or 18
+    local t = dist / speed
+    if t < 0 then t = 0 end
+    if t > 2.5 then t = 2.5 end  -- hard cap for absurd ranges
+    local scale = sli("aim_drop_scale", 100) / 100
+    if scale < 0 then scale = 0 end
+    if scale > 3 then scale = 3 end
+    local dy = 0.5 * grav * t * t * scale
+    AIM.last_drop = dy
+    AIM.last_tflight = t
+    return dy
+end
+
 local function predict(key, x, y, z)
     local st = weapon_stats()
     local speed = math.max(80, st.speed or 1000)
@@ -4142,10 +4210,29 @@ local function predict(key, x, y, z)
         sax = sax, say = say, saz = saz,
     }
 
-    local want_pred = chk("aim_pred", true)
+    local want_pred = chk("aim_pred", false)  -- false fallback: must be explicitly on
+    -- also honor UI_STATE if set via on_change
+    if AIM.pred_enabled ~= nil then want_pred = AIM.pred_enabled end
     local want_drop = chk("aim_drop", true)
+    if AIM.drop_enabled ~= nil then want_drop = AIM.drop_enabled end
+
     if not want_pred and not want_drop then
+        AIM.pred_sx, AIM.pred_sy = nil, nil
         return x, y, z
+    end
+
+    -- Prediction OFF: no velocity lead, only optional drop
+    if not want_pred then
+        local lx2, ly2, lz2 = nlocal_xyz()
+        local py = y
+        if want_drop and lx2 then
+            local dist0 = math.sqrt((x-lx2)^2+(y-ly2)^2+(z-lz2)^2)
+            py = y + bullet_drop_dy(dist0, speed, grav)
+        else
+            AIM.last_drop = 0
+        end
+        AIM.pred_sx, AIM.pred_sy = nil, nil
+        return x, py, z
     end
 
     local lx, ly, lz = nlocal_xyz()
@@ -4247,9 +4334,15 @@ local function predict(key, x, y, z)
         pz = z + vz * t + 0.5 * az * t * t
     end
 
-    -- Bullet drop compensation (aim higher)
-    if want_drop and t_flight > 0.001 then
-        py = py + 0.5 * grav * t_flight * t_flight
+    -- Bullet drop: raise aim by 0.5*g*t^2 * DropScale
+    -- Use distance to *predicted* point for t (more accurate at range)
+    if want_drop then
+        local ddx, ddy, ddz = px - lx, py - ly, pz - lz
+        local dist_aim = math.sqrt(ddx*ddx + ddy*ddy + ddz*ddz)
+        if dist_aim < dist0 then dist_aim = dist0 end
+        py = py + bullet_drop_dy(dist_aim, speed, grav)
+    else
+        AIM.last_drop = 0
     end
 
     -- Visualize predicted world point
@@ -4318,7 +4411,7 @@ local function collect_candidates(lx, ly, lz, fov, range)
                                 end
                             end
                         end
-                        local bx, by, bz, bn = bone_from_xyz(hx, hy, hz, rx, ry, rz)
+                        local bx, by, bz, bn = bone_from_xyz(hx, hy, hz, rx, ry, rz, "p:" .. tostring(e.addr))
                         local sx, sy = w2s(bx, by, bz)
                         if sx then
                             local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
@@ -4344,7 +4437,7 @@ local function collect_candidates(lx, ly, lz, fov, range)
             if e and e.status == "alive" and e.x and npc_kind_ok(e.kind) then
                 local dist = math.sqrt((e.x-lx)^2+(e.y-ly)^2+(e.z-lz)^2)
                 if dist <= range then
-                    local bx, by, bz, bn = bone_from_xyz(e.x, e.y, e.z, e.fx or e.x, e.fy or e.y, e.fz or e.z)
+                    local bx, by, bz, bn = bone_from_xyz(e.x, e.y, e.z, e.fx or e.x, e.fy or e.y, e.fz or e.z, e.key)
                     local sx, sy = w2s(bx, by, bz)
                     if sx then
                         local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
@@ -4381,7 +4474,7 @@ local function pick(lx, ly, lz)
             if e and e.alive then
                 local dist = e.dist or math.sqrt((e.hx-lx)^2+(e.hy-ly)^2+(e.hz-lz)^2)
                 if dist <= range then
-                    local bx, by, bz, bn = bone_from_xyz(e.hx, e.hy, e.hz, e.rx or e.hx, e.ry or e.hy, e.rz or e.hz)
+                    local bx, by, bz, bn = bone_from_xyz(e.hx, e.hy, e.hz, e.rx or e.hx, e.ry or e.hy, e.rz or e.hz, "p:" .. tostring(L.addr))
                     local sx, sy = w2s(bx, by, bz)
                     if sx then
                         local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
@@ -4396,7 +4489,7 @@ local function pick(lx, ly, lz)
             if e and e.status == "alive" and e.x and npc_kind_ok(e.kind) then
                 local dist = math.sqrt((e.x-lx)^2+(e.y-ly)^2+(e.z-lz)^2)
                 if dist <= range then
-                    local bx, by, bz, bn = bone_from_xyz(e.x, e.y, e.z, e.fx or e.x, e.fy or e.y, e.fz or e.z)
+                    local bx, by, bz, bn = bone_from_xyz(e.x, e.y, e.z, e.fx or e.x, e.fy or e.y, e.fz or e.z, L.key)
                     local sx, sy = w2s(bx, by, bz)
                     if sx then
                         local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
@@ -4424,79 +4517,105 @@ local function pick(lx, ly, lz)
 end
 
 --[[
-  Mouse Aim  = OS cursor emulation: Windows.MoveMouse toward target screen pos
-               (game camera follows the physical/system cursor)
-  Camera Aim = engine camera: aim.look_at_matrix + aim.set_camera_rotation
-               (direct view matrix, no cursor move)
+  Mouse Aim  = OS cursor: Windows.MoveMouse / aim.move_mouse toward screen pos
+  Camera Aim = look_at_matrix on EMA-smoothed world point (no matrix lerp = no shake)
 ]]
 local function apply_aim(x, y, z, smooth)
-    smooth = math.max(1, smooth or 6)
+    smooth = math.max(1, tonumber(smooth) or 6)
 
     local use_cam = chk("aim_method_cam", false)
     local use_mouse = chk("aim_method_mouse", true)
     if use_cam then use_mouse = false end
     if not use_cam and not use_mouse then use_mouse = true end
 
-    -- ===== MOUSE AIM =====
-    -- w2s / aim.world_to_screen = game client pixels; GetMousePos = screen pixels.
-    -- Use one space only: prefer aim.move_mouse (client) or MoveMouse with screen delta.
-    if use_mouse then
-        local sx, sy = w2s(x, y, z)
-        if not sx then return false end
-        local t = 1 / smooth
-
-        -- 1) Blueberry aim.move_mouse (expects client/screen pos from world_to_screen)
-        if aim and aim.move_mouse then
-            local ok, mp = pcall(function()
-                if Windows and Windows.GetMousePos then return Windows.GetMousePos() end
-            end)
-            if ok and mp and mp.X then
-                pcall(function()
-                    aim.move_mouse({ X = mp.X + (sx - mp.X) * t, Y = mp.Y + (sy - mp.Y) * t })
-                end)
-            else
-                pcall(function() aim.move_mouse({ X = sx, Y = sy }) end)
-            end
-            return true
+    -- EMA-smooth aim point in world space (kills shake + Closest jitter)
+    local alpha = 1 / smooth
+    if alpha > 1 then alpha = 1 end
+    if alpha < 0.02 then alpha = 0.02 end
+    if not AIM.sm_x then
+        AIM.sm_x, AIM.sm_y, AIM.sm_z = x, y, z
+    else
+        -- reset smoother if target jumped far (new target)
+        local jdx = x - AIM.sm_x
+        local jdy = y - AIM.sm_y
+        local jdz = z - AIM.sm_z
+        if (jdx*jdx + jdy*jdy + jdz*jdz) > 225 then -- >15 studs
+            AIM.sm_x, AIM.sm_y, AIM.sm_z = x, y, z
+        else
+            AIM.sm_x = AIM.sm_x + (x - AIM.sm_x) * alpha
+            AIM.sm_y = AIM.sm_y + (y - AIM.sm_y) * alpha
+            AIM.sm_z = AIM.sm_z + (z - AIM.sm_z) * alpha
         end
+    end
+    local ax, ay, az = AIM.sm_x, AIM.sm_y, AIM.sm_z
 
-        -- 2) Windows.MoveMouse — same coordinate space as GetMousePos (screen)
+    -- ===== MOUSE AIM =====
+    if use_mouse then
+        local sx, sy = w2s(ax, ay, az)
+        if not sx then return false end
+
+        -- Preferred: physical cursor with smooth step from current mouse
         if Windows and Windows.GetMousePos and Windows.MoveMouse then
             local ok, mp = pcall(function() return Windows.GetMousePos() end)
-            if ok and mp and mp.X then
-                pcall(function()
-                    Windows.MoveMouse(mp.X + (sx - mp.X) * t, mp.Y + (sy - mp.Y) * t)
-                end)
+            if ok and mp and type(mp.X) == "number" then
+                -- If w2s is client-space, convert using window origin
+                local tx, ty = sx, sy
+                if Windows.GetRobloxWindow and Windows.GetWindowRect then
+                    local okw, hwnd = pcall(function() return Windows.GetRobloxWindow() end)
+                    if okw and hwnd then
+                        local okr, rect = pcall(function() return Windows.GetWindowRect(hwnd) end)
+                        if okr and rect and rect.Left then
+                            -- client to screen if sx looks like client (0..width)
+                            local cw = rect.Width or (rect.Right - rect.Left)
+                            if sx >= 0 and sx <= (cw + 50) then
+                                tx = rect.Left + sx
+                                ty = (rect.Top or 0) + sy
+                                -- title bar offset rough if client area
+                                if Windows.GetRobloxClientSize then
+                                    local okc, cs = pcall(function() return Windows.GetRobloxClientSize() end)
+                                    if okc and cs and cs.Width and math.abs(cs.Width - cw) > 10 then
+                                        -- GetMousePos is screen; world_to_screen often client
+                                        tx = rect.Left + sx
+                                        ty = rect.Top + sy
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                local t = alpha
+                local nx = mp.X + (tx - mp.X) * t
+                local ny = mp.Y + (ty - mp.Y) * t
+                pcall(function() Windows.MoveMouse(nx, ny) end)
+                -- also write_mouse in client space for game input
+                if aim and aim.write_mouse then
+                    pcall(function() aim.write_mouse({ X = sx, Y = sy }) end)
+                end
                 return true
             end
+        end
+
+        if aim and aim.move_mouse then
+            pcall(function() aim.move_mouse({ X = sx, Y = sy }) end)
+            return true
+        end
+        if aim and aim.write_mouse then
+            pcall(function() aim.write_mouse({ X = sx, Y = sy }) end)
+            return true
         end
         return false
     end
 
     -- ===== CAMERA AIM =====
+    -- Full look_at each frame on smoothed point — do NOT lerp matrix elements
     if not (aim and aim.look_at_matrix and aim.set_camera_rotation and aim.get_camera_position) then
         return false
     end
     local ok, cpos = pcall(function() return aim.get_camera_position() end)
     if not ok or not cpos then return false end
-    local ok2, m = pcall(function() return aim.look_at_matrix(cpos, v3(x, y, z)) end)
+    local ok2, m = pcall(function() return aim.look_at_matrix(cpos, v3(ax, ay, az)) end)
     if not ok2 or not m then return false end
-
-    if smooth <= 1 then
-        pcall(function() aim.set_camera_rotation(m) end)
-        return true
-    end
-    local ok3, cur = pcall(function() return aim.get_camera_rotation() end)
-    if ok3 and cur then
-        local t = 1 / smooth
-        local out = {}
-        for i = 1, 9 do
-            out[i] = (cur[i] or 0) + ((m[i] or 0) - (cur[i] or 0)) * t
-        end
-        pcall(function() aim.set_camera_rotation(out) end)
-    else
-        pcall(function() aim.set_camera_rotation(m) end)
-    end
+    pcall(function() aim.set_camera_rotation(m) end)
     return true
 end
 
@@ -4572,7 +4691,8 @@ hooks.on_render(function()
             local wep = AIM.last_wep or "?"
             local spd = AIM.last_speed or 0
             local pg = sli("aim_ping", 50)
-            Drawing.DrawText(12, 54, string.format("wep:%s spd:%.0f ping:%dms", tostring(wep), spd, pg), 0.7, 0.85, 1, 0.85)
+            Drawing.DrawText(12, 54, string.format("wep:%s spd:%.0f ping:%dms drop:%.1f t:%.2f",
+                tostring(wep), spd, pg, AIM.last_drop or 0, AIM.last_tflight or 0), 0.7, 0.85, 1, 0.85)
         end)
     end
 
@@ -4591,6 +4711,8 @@ hooks.on_render(function()
     if not held then
         AIM.locked = nil
         AIM.hz.id = nil
+        AIM.bone_lock = nil
+        AIM.sm_x, AIM.sm_y, AIM.sm_z = nil, nil, nil
         return
     end
 
