@@ -3776,31 +3776,35 @@ local function vk_label(vk)
 end
 
 local function set_key_txt()
-    local t = AIM.capture and "Active Key: press key..." or ("Active Key: " .. vk_label(AIM.vk))
+    local t
+    if AIM.capture then
+        t = "Active Key: press key..."
+    else
+        t = "Active Key: " .. vk_label(AIM.vk) .. " (" .. tostring(AIM.vk or 0) .. ")"
+    end
     pcall(function()
         if UIManager.SetText then UIManager.SetText("aim_key_txt", t)
         elseif UIManager.SetElementText then UIManager.SetElementText("aim_key_txt", t) end
     end)
 end
 
--- Capture: edge-detect keys after delay; never LMB/RMB as primary (RMB allowed after delay)
+-- Capture: edge-detect keys after delay; never LMB
 local function poll_capture()
     if not AIM.capture then return end
     if not Windows or not Windows.IsKeyPressed then return end
     local now = tick()
     if now < AIM.capture_until then return end
     AIM._cap_edges = AIM._cap_edges or {}
-    -- prefer letters/numbers/F-keys first
     local prefer = {}
     for c = 0x30, 0x39 do prefer[#prefer+1] = c end
     for c = 0x41, 0x5A do prefer[#prefer+1] = c end
     for c = 0x70, 0x7B do prefer[#prefer+1] = c end
-    prefer[#prefer+1] = 0x20 -- space
-    prefer[#prefer+1] = 0x10 -- shift
-    prefer[#prefer+1] = 0x11 -- ctrl
-    prefer[#prefer+1] = 0x05 -- xbutton1
-    prefer[#prefer+1] = 0x06 -- xbutton2
-    prefer[#prefer+1] = 0x02 -- RMB last resort
+    prefer[#prefer+1] = 0x20
+    prefer[#prefer+1] = 0x10
+    prefer[#prefer+1] = 0x11
+    prefer[#prefer+1] = 0x05
+    prefer[#prefer+1] = 0x06
+    prefer[#prefer+1] = 0x02
     for i = 1, #prefer do
         local vk = prefer[i]
         if vk == 0x01 then goto cont end
@@ -3827,36 +3831,44 @@ end
 
 local function sync_vk_from_widget()
     if not UIManager then return end
+    local vk = nil
     if UIManager.GetKeybindValue then
-        local ok, vk = pcall(function() return UIManager.GetKeybindValue("aim_keybind") end)
-        if ok and type(vk) == "number" and vk > 1 then
-            AIM.vk = vk
-        elseif ok and vk == 1 then
-            -- force off LMB
-            local def = (VK and VK.E) or 0x45
-            AIM.vk = def
-            if UIManager.SetKeybindValue then
-                pcall(function() UIManager.SetKeybindValue("aim_keybind", def) end)
-            end
+        local ok, v = pcall(function() return UIManager.GetKeybindValue("aim_keybind") end)
+        if ok and type(v) == "number" then vk = v end
+    end
+    if vk == 1 then
+        -- LMB not allowed for aim hold
+        local def = (VK and VK.E) or 0x45
+        AIM.vk = def
+        if UIManager.SetKeybindValue then
+            pcall(function() UIManager.SetKeybindValue("aim_keybind", def) end)
         end
+        return
+    end
+    if type(vk) == "number" and vk > 0 then
+        AIM.vk = vk
     end
 end
 
 local function aim_key_held()
     if AIM.capture then return false end
     sync_vk_from_widget()
-    local vk = AIM.vk
-    if not vk or vk == 0 or vk == 1 then return false end
-    -- Primary: OS-level hold (most reliable)
-    if Windows and Windows.IsKeyPressed then
-        local ok, held = pcall(function() return Windows.IsKeyPressed(vk) end)
-        if ok and held then return true end
-    end
-    -- Secondary: widget
+
+    -- 1) Official widget hold (tracks CreateKeybind even if we lag)
     if UIManager and UIManager.IsKeybindPressed then
         local ok, held = pcall(function() return UIManager.IsKeybindPressed("aim_keybind") end)
         if ok and held == true then return true end
     end
+
+    local vk = AIM.vk
+    if not vk or vk == 0 or vk == 1 then return false end
+
+    -- 2) OS-level VK (keyboard + mouse side buttons / RMB)
+    if Windows and Windows.IsKeyPressed then
+        local ok, held = pcall(function() return Windows.IsKeyPressed(vk) end)
+        if ok and held then return true end
+    end
+
     return false
 end
 
@@ -4501,6 +4513,8 @@ local function fov_color()
 end
 
 local function draw_fov()
+    -- FOV only while aimbot enabled
+    if not chk("aim_en", false) then return end
     if not chk("aim_drawfov", true) then return end
     local cx, cy = center()
     local fov = sli("aim_fov", 150)
@@ -4560,7 +4574,15 @@ hooks.on_render(function()
         AIM.locked = nil
         return
     end
-    if not aim_key_held() then
+    local held = aim_key_held()
+    if Drawing and Drawing.DrawText then
+        pcall(function()
+            Drawing.DrawText(12, 68, string.format("aimKey:%s held:%s players:%s",
+                tostring(AIM.vk), held and "Y" or "N",
+                chk("aim_players", true) and "Y" or "N"), 0.9, 0.9, 0.4, 0.9)
+        end)
+    end
+    if not held then
         AIM.locked = nil
         AIM.hz.id = nil
         return
