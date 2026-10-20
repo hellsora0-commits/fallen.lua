@@ -3775,6 +3775,20 @@ local function vk_label(vk)
     return VKN[vk] or ("VK"..tostring(vk))
 end
 
+local function read_widget_vk()
+    if not UIManager then return nil end
+    -- try all known accessors
+    if UIManager.GetKeybindValue then
+        local ok, v = pcall(function() return UIManager.GetKeybindValue("aim_keybind") end)
+        if ok and type(v) == "number" and v > 0 then return v end
+    end
+    if UIManager.GetKeybind then
+        local ok, v = pcall(function() return UIManager.GetKeybind("aim_keybind") end)
+        if ok and type(v) == "number" and v > 0 then return v end
+    end
+    return nil
+end
+
 local function set_key_txt()
     local t
     if AIM.capture then
@@ -3782,44 +3796,44 @@ local function set_key_txt()
     else
         t = "Active Key: " .. vk_label(AIM.vk) .. " (" .. tostring(AIM.vk or 0) .. ")"
     end
+    -- try every text setter Blueberry might have
     pcall(function()
-        if UIManager.SetText then UIManager.SetText("aim_key_txt", t)
-        elseif UIManager.SetElementText then UIManager.SetElementText("aim_key_txt", t) end
+        if UIManager.SetText then UIManager.SetText("aim_key_txt", t) end
+    end)
+    pcall(function()
+        if UIManager.SetElementText then UIManager.SetElementText("aim_key_txt", t) end
+    end)
+    pcall(function()
+        if UIManager.SetLabel then UIManager.SetLabel("aim_key_txt", t) end
     end)
 end
 
--- Capture: edge-detect keys after delay; never LMB
 local function poll_capture()
     if not AIM.capture then return end
     if not Windows or not Windows.IsKeyPressed then return end
-    local now = tick()
-    if now < AIM.capture_until then return end
+    if tick() < (AIM.capture_until or 0) then return end
     AIM._cap_edges = AIM._cap_edges or {}
     local prefer = {}
     for c = 0x30, 0x39 do prefer[#prefer+1] = c end
     for c = 0x41, 0x5A do prefer[#prefer+1] = c end
     for c = 0x70, 0x7B do prefer[#prefer+1] = c end
-    prefer[#prefer+1] = 0x20
-    prefer[#prefer+1] = 0x10
-    prefer[#prefer+1] = 0x11
-    prefer[#prefer+1] = 0x05
-    prefer[#prefer+1] = 0x06
-    prefer[#prefer+1] = 0x02
+    for _, c in ipairs({0x20, 0x10, 0x11, 0x05, 0x06, 0x02, 0x04}) do
+        prefer[#prefer+1] = c
+    end
     for i = 1, #prefer do
         local vk = prefer[i]
-        if vk == 0x01 then goto cont end
+        if vk == 1 then goto cont end
         local ok, down = pcall(function() return Windows.IsKeyPressed(vk) end)
         if ok and down then
-            local was = AIM._cap_edges[vk]
-            AIM._cap_edges[vk] = true
-            if not was then
+            if not AIM._cap_edges[vk] then
+                AIM._cap_edges[vk] = true
                 AIM.vk = vk
                 AIM.capture = false
-                if UIManager and UIManager.SetKeybindValue then
-                    pcall(function() UIManager.SetKeybindValue("aim_keybind", vk) end)
-                end
+                pcall(function()
+                    if UIManager.SetKeybindValue then UIManager.SetKeybindValue("aim_keybind", vk) end
+                end)
                 set_key_txt()
-                if notify then notify("Aim key set: " .. vk_label(vk), "success") end
+                if notify then notify("Aim key set: " .. vk_label(vk) .. " (" .. vk .. ")", "success") end
                 return
             end
         else
@@ -3830,45 +3844,37 @@ local function poll_capture()
 end
 
 local function sync_vk_from_widget()
-    if not UIManager then return end
-    local vk = nil
-    if UIManager.GetKeybindValue then
-        local ok, v = pcall(function() return UIManager.GetKeybindValue("aim_keybind") end)
-        if ok and type(v) == "number" then vk = v end
-    end
+    local vk = read_widget_vk()
+    if not vk then return end
     if vk == 1 then
-        -- LMB not allowed for aim hold
         local def = (VK and VK.E) or 0x45
         AIM.vk = def
-        if UIManager.SetKeybindValue then
-            pcall(function() UIManager.SetKeybindValue("aim_keybind", def) end)
-        end
+        pcall(function()
+            if UIManager.SetKeybindValue then UIManager.SetKeybindValue("aim_keybind", def) end
+        end)
         return
     end
-    if type(vk) == "number" and vk > 0 then
-        AIM.vk = vk
-    end
+    AIM.vk = vk
 end
 
 local function aim_key_held()
     if AIM.capture then return false end
     sync_vk_from_widget()
+    set_key_txt()
 
-    -- 1) Official widget hold (tracks CreateKeybind even if we lag)
+    -- Widget hold first (matches [VK N] in menu)
     if UIManager and UIManager.IsKeybindPressed then
         local ok, held = pcall(function() return UIManager.IsKeybindPressed("aim_keybind") end)
         if ok and held == true then return true end
     end
 
     local vk = AIM.vk
-    if not vk or vk == 0 or vk == 1 then return false end
+    if type(vk) ~= "number" or vk <= 0 or vk == 1 then return false end
 
-    -- 2) OS-level VK (keyboard + mouse side buttons / RMB)
     if Windows and Windows.IsKeyPressed then
         local ok, held = pcall(function() return Windows.IsKeyPressed(vk) end)
         if ok and held then return true end
     end
-
     return false
 end
 
