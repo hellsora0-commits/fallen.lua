@@ -3120,10 +3120,19 @@ local function ndraw_skel(e, c)
     ln(1,2) ln(2,3) ln(3,4) ln(2,5) ln(2,6)
 end
 
+-- Per-id state: не полагаемся только на GetCheckboxValue (у BB иногда путаются одинаковые label)
+local NPC_UI = {}
+
 local function nui_check(id, fallback)
+    if NPC_UI[id] ~= nil then
+        return NPC_UI[id] == true
+    end
     if UIManager and UIManager.GetCheckboxValue then
         local v = nsafe(function() return UIManager.GetCheckboxValue(id) end, nil)
-        if v ~= nil then return v == true end
+        if v ~= nil then
+            NPC_UI[id] = (v == true)
+            return NPC_UI[id]
+        end
     end
     return fallback and true or false
 end
@@ -3263,9 +3272,13 @@ local function nsame(id)
     nsafe(function() UIManager.SetElementSameLine(id, true) end)
 end
 local function ncheck(id, label, default, key)
+    local def = default and true or false
+    NPC_UI[id] = def
     nsafe(function()
-        UIManager.CreateCheckbox(id, label, default, function(v)
-            NPC_CFG[key] = v and true or false
+        UIManager.CreateCheckbox(id, label, def, function(v)
+            local on = v and true or false
+            NPC_UI[id] = on
+            if key then NPC_CFG[key] = on end
         end)
     end)
     nparent(id)
@@ -3273,9 +3286,10 @@ end
 local function nrow(id, label, default, key, cid, col)
     ncheck(id, label, default, key)
     local r,g,b,a = col[1], col[2], col[3], col[4] or 1
-    nsafe(function() UIManager.CreateColorPicker(cid, " ", r,g,b,a) end)
+    -- color picker label unique (not empty space) to avoid UI collisions
+    nsafe(function() UIManager.CreateColorPicker(cid, label .. " color", r,g,b,a) end)
     nparent(cid)
-    nsame(cid)
+    -- NOT same line: SameLine + two "Box" rows was causing click bleed between Mil/Boss
 end
 local function nread_color(id, dest)
     if UIManager and UIManager.GetColorPicker then
@@ -3302,11 +3316,11 @@ nsafe(function() UIManager.CreateText("fn_mil_h", "Military") end); nparent("fn_
 ncheck("fn_mil_en", "Enable Military", NPC_CFG.mil_enabled, "mil_enabled")
 nsafe(function() UIManager.CreateSliderInt("fn_mil_range", "Range", 0, 1000, NPC_CFG.mil_range) end)
 nparent("fn_mil_range")
-nrow("fn_mil_box",  "Box",        NPC_CFG.mil_box,  "mil_box",  "fn_mil_box_c",  NPC_CFG.mil_col_box)
-nrow("fn_mil_name", "Name",       NPC_CFG.mil_name, "mil_name", "fn_mil_name_c", NPC_CFG.mil_col_name)
-nrow("fn_mil_hp",   "Health Bar", NPC_CFG.mil_hp,   "mil_hp",   "fn_mil_hp_c",   NPC_CFG.mil_col_hp)
-nrow("fn_mil_dist", "Distance",   NPC_CFG.mil_dist, "mil_dist", "fn_mil_dist_c", NPC_CFG.mil_col_dist)
-nrow("fn_mil_skel", "Skeleton",   NPC_CFG.mil_skel, "mil_skel", "fn_mil_skel_c", NPC_CFG.mil_col_skel)
+nrow("fn_mil_box",  "Mil Box",        NPC_CFG.mil_box,  "mil_box",  "fn_mil_box_c",  NPC_CFG.mil_col_box)
+nrow("fn_mil_name", "Mil Name",       NPC_CFG.mil_name, "mil_name", "fn_mil_name_c", NPC_CFG.mil_col_name)
+nrow("fn_mil_hp",   "Mil Health", NPC_CFG.mil_hp,   "mil_hp",   "fn_mil_hp_c",   NPC_CFG.mil_col_hp)
+nrow("fn_mil_dist", "Mil Distance",   NPC_CFG.mil_dist, "mil_dist", "fn_mil_dist_c", NPC_CFG.mil_col_dist)
+nrow("fn_mil_skel", "Mil Skeleton",   NPC_CFG.mil_skel, "mil_skel", "fn_mil_skel_c", NPC_CFG.mil_col_skel)
 
 nsafe(function() UIManager.CreateSeparator("fn_sep1") end); nparent("fn_sep1")
 nsafe(function() UIManager.CreateText("fn_boss_h", "Bosses") end); nparent("fn_boss_h")
@@ -3318,11 +3332,11 @@ nrow("fn_bruno",  "Bruno",  NPC_CFG.bruno,  "bruno",  "fn_bruno_c",  NPC_CFG.bru
 nrow("fn_brutus", "Brutus", NPC_CFG.brutus, "brutus", "fn_brutus_c", NPC_CFG.brutus_col)
 
 nsafe(function() UIManager.CreateSeparator("fn_sep2") end); nparent("fn_sep2")
-nrow("fn_boss_box",  "Box",        NPC_CFG.boss_box,  "boss_box",  "fn_boss_box_c",  NPC_CFG.boss_col_box)
-nrow("fn_boss_name", "Name",       NPC_CFG.boss_name, "boss_name", "fn_boss_name_c", NPC_CFG.boss_col_name)
-nrow("fn_boss_hp",   "Health Bar", NPC_CFG.boss_hp,   "boss_hp",   "fn_boss_hp_c",   NPC_CFG.boss_col_hp)
-nrow("fn_boss_dist", "Distance",   NPC_CFG.boss_dist, "boss_dist", "fn_boss_dist_c", NPC_CFG.boss_col_dist)
-nrow("fn_boss_skel", "Skeleton",   NPC_CFG.boss_skel, "boss_skel", "fn_boss_skel_c", NPC_CFG.boss_col_skel)
+nrow("fn_boss_box",  "Boss Box",        NPC_CFG.boss_box,  "boss_box",  "fn_boss_box_c",  NPC_CFG.boss_col_box)
+nrow("fn_boss_name", "Boss Name",       NPC_CFG.boss_name, "boss_name", "fn_boss_name_c", NPC_CFG.boss_col_name)
+nrow("fn_boss_hp",   "Boss Health", NPC_CFG.boss_hp,   "boss_hp",   "fn_boss_hp_c",   NPC_CFG.boss_col_hp)
+nrow("fn_boss_dist", "Boss Distance",   NPC_CFG.boss_dist, "boss_dist", "fn_boss_dist_c", NPC_CFG.boss_col_dist)
+nrow("fn_boss_skel", "Boss Skeleton",   NPC_CFG.boss_skel, "boss_skel", "fn_boss_skel_c", NPC_CFG.boss_col_skel)
 
 -- nsync больше не нужен: ndraw_one читает UI live через GetCheckboxValue / GetColorPickerValue / GetSliderIntValue
 
@@ -3339,9 +3353,9 @@ hooks.on_render(function()
 
     nsafe(function()
         Drawing.DrawText(12, 12, "NPC: " .. tostring(npc_debug), 1, 1, 0, 1)
-        local mb = (UIManager and UIManager.GetCheckboxValue and UIManager.GetCheckboxValue("fn_mil_box")) and "1" or "0"
-        local bb = (UIManager and UIManager.GetCheckboxValue and UIManager.GetCheckboxValue("fn_boss_box")) and "1" or "0"
-        Drawing.DrawText(12, 26, "box mil=" .. tostring(mb) .. " boss=" .. tostring(bb), 0.8, 0.8, 0.2, 1)
+        local mb = nui_check("fn_mil_box", true) and "1" or "0"
+        local bb = nui_check("fn_boss_box", true) and "1" or "0"
+        Drawing.DrawText(12, 26, "box mil=" .. mb .. " boss=" .. bb, 0.8, 0.8, 0.2, 1)
     end)
 
     if not nui_check("fn_master", NPC_CFG.enabled) then return end
@@ -3446,25 +3460,44 @@ pcall(function() UIManager.CreateCheckbox("aim_en", "Enable Aimbot", false) end)
 pcall(function() UIManager.CreateCheckbox("aim_players", "Target Players", true) end); parent("aim_players")
 pcall(function() UIManager.CreateCheckbox("aim_npcs", "Target NPCs", true) end); parent("aim_npcs")
 
--- Official CreateKeybind (default E so first click is not empty/LMB chaos)
-pcall(function()
-    if UIManager.CreateKeybind then
-        local def = (VK and VK.E) or 0x45
-        UIManager.CreateKeybind("aim_keybind", "Aim Key (hold)", def)
+-- Keybind: official CreateKeybind + on_change stores VK. Never use LMB (1).
+do
+    local def = 0x45 -- E
+    if VK and VK.E then def = VK.E end
+    AIM.vk = def
+    pcall(function()
+        if UIManager.CreateKeybind then
+            UIManager.CreateKeybind("aim_keybind", "Aim Key (hold)", def, function(vk)
+                if type(vk) == "number" and vk > 1 then
+                    AIM.vk = vk
+                    if notify then notify("Aim Key = " .. tostring(vk), "success") end
+                elseif type(vk) == "number" and vk == 1 then
+                    -- LMB captured by mistake: force back to E
+                    AIM.vk = def
+                    if UIManager.SetKeybindValue then
+                        pcall(function() UIManager.SetKeybindValue("aim_keybind", def) end)
+                    end
+                    if notify then notify("LMB ignored — set a KEYBOARD key", "warning") end
+                end
+            end)
+        end
+    end)
+    parent("aim_keybind")
+    if UIManager.SetKeybindValue then
+        pcall(function() UIManager.SetKeybindValue("aim_keybind", def) end)
     end
-end)
-parent("aim_keybind")
+end
 
--- Backup: Set Aim Key button (LMB-safe capture)
 pcall(function()
-    UIManager.CreateButton("aim_setkey", "Set Aim Key (keyboard)", function()
+    UIManager.CreateButton("aim_setkey", "Set Aim Key (press key after click)", function()
         AIM.capture = true
-        AIM.capture_until = tick() + 0.55
-        if notify then notify("Press a KEYBOARD key now (mouse ignored 0.55s)", "normal") end
+        AIM.capture_until = tick() + 0.6
+        AIM._cap_edges = {}
+        if notify then notify("Click OK — then press E/X/C... (not mouse)", "normal") end
     end)
 end)
 parent("aim_setkey")
-pcall(function() UIManager.CreateText("aim_key_txt", "Custom Key: none") end); parent("aim_key_txt")
+pcall(function() UIManager.CreateText("aim_key_txt", "Active Key: E") end); parent("aim_key_txt")
 
 pcall(function() UIManager.CreateSeparator("aim_sep1") end); parent("aim_sep1")
 pcall(function() UIManager.CreateText("aim_npc_h", "NPC filters") end); parent("aim_npc_h")
@@ -3552,65 +3585,117 @@ local function vk_label(vk)
 end
 
 local function set_key_txt()
-    local t = AIM.capture and "Custom Key: press key..." or ("Custom Key: " .. vk_label(AIM.vk))
+    local t = AIM.capture and "Active Key: press key..." or ("Active Key: " .. vk_label(AIM.vk))
     pcall(function()
         if UIManager.SetText then UIManager.SetText("aim_key_txt", t)
         elseif UIManager.SetElementText then UIManager.SetElementText("aim_key_txt", t) end
     end)
 end
 
--- Capture: ignore mouse buttons always; after delay accept keyboard / side mouse
+-- Capture: edge-detect keys after delay; never LMB/RMB as primary (RMB allowed after delay)
 local function poll_capture()
     if not AIM.capture then return end
     if not Windows or not Windows.IsKeyPressed then return end
-    if tick() < AIM.capture_until then return end
-    for vk = 0x08, 0xFE do
-        if vk == 0x01 then goto continue end -- never bind LMB via capture
+    local now = tick()
+    if now < AIM.capture_until then return end
+    AIM._cap_edges = AIM._cap_edges or {}
+    -- prefer letters/numbers/F-keys first
+    local prefer = {}
+    for c = 0x30, 0x39 do prefer[#prefer+1] = c end
+    for c = 0x41, 0x5A do prefer[#prefer+1] = c end
+    for c = 0x70, 0x7B do prefer[#prefer+1] = c end
+    prefer[#prefer+1] = 0x20 -- space
+    prefer[#prefer+1] = 0x10 -- shift
+    prefer[#prefer+1] = 0x11 -- ctrl
+    prefer[#prefer+1] = 0x05 -- xbutton1
+    prefer[#prefer+1] = 0x06 -- xbutton2
+    prefer[#prefer+1] = 0x02 -- RMB last resort
+    for i = 1, #prefer do
+        local vk = prefer[i]
+        if vk == 0x01 then goto cont end
         local ok, down = pcall(function() return Windows.IsKeyPressed(vk) end)
         if ok and down then
-            AIM.vk = vk
-            AIM.capture = false
-            set_key_txt()
-            if notify then notify("Aim key set: " .. vk_label(vk), "success") end
-            return
+            local was = AIM._cap_edges[vk]
+            AIM._cap_edges[vk] = true
+            if not was then
+                AIM.vk = vk
+                AIM.capture = false
+                if UIManager and UIManager.SetKeybindValue then
+                    pcall(function() UIManager.SetKeybindValue("aim_keybind", vk) end)
+                end
+                set_key_txt()
+                if notify then notify("Aim key set: " .. vk_label(vk), "success") end
+                return
+            end
+        else
+            AIM._cap_edges[vk] = false
         end
-        ::continue::
+        ::cont::
+    end
+end
+
+local function sync_vk_from_widget()
+    if not UIManager then return end
+    if UIManager.GetKeybindValue then
+        local ok, vk = pcall(function() return UIManager.GetKeybindValue("aim_keybind") end)
+        if ok and type(vk) == "number" and vk > 1 then
+            AIM.vk = vk
+        elseif ok and vk == 1 then
+            -- force off LMB
+            local def = (VK and VK.E) or 0x45
+            AIM.vk = def
+            if UIManager.SetKeybindValue then
+                pcall(function() UIManager.SetKeybindValue("aim_keybind", def) end)
+            end
+        end
     end
 end
 
 local function aim_key_held()
     if AIM.capture then return false end
-    -- 1) Official keybind widget
+    sync_vk_from_widget()
+    local vk = AIM.vk
+    if not vk or vk == 0 or vk == 1 then return false end
+    -- Primary: OS-level hold (most reliable)
+    if Windows and Windows.IsKeyPressed then
+        local ok, held = pcall(function() return Windows.IsKeyPressed(vk) end)
+        if ok and held then return true end
+    end
+    -- Secondary: widget
     if UIManager and UIManager.IsKeybindPressed then
         local ok, held = pcall(function() return UIManager.IsKeybindPressed("aim_keybind") end)
         if ok and held == true then return true end
-    end
-    -- 2) Custom VK from Set Aim Key
-    if AIM.vk and AIM.vk ~= 0 and Windows and Windows.IsKeyPressed then
-        local ok, held = pcall(function() return Windows.IsKeyPressed(AIM.vk) end)
-        if ok and held then return true end
-    end
-    -- 3) GetKeybindValue + IsKeyPressed
-    if UIManager and UIManager.GetKeybindValue and Windows and Windows.IsKeyPressed then
-        local ok, vk = pcall(function() return UIManager.GetKeybindValue("aim_keybind") end)
-        if ok and type(vk) == "number" and vk > 0 and vk ~= 1 then
-            local ok2, held = pcall(function() return Windows.IsKeyPressed(vk) end)
-            if ok2 and held then return true end
-        end
     end
     return false
 end
 
 local function center()
+    -- 1) ScreenSize() from docs
+    if type(ScreenSize) == "function" then
+        local ok, s = pcall(ScreenSize)
+        if ok and s then
+            local w = s.Width or s.X or s[1]
+            local h = s.Height or s.Y or s[2]
+            if type(w) == "number" and w > 0 then return w * 0.5, h * 0.5, w, h end
+        end
+    end
     if rbx and rbx.screen_dim then
         local ok, d = pcall(function() return rbx.screen_dim() end)
-        if ok and d and d.Width then return d.Width * 0.5, d.Height * 0.5 end
+        if ok and d then
+            local w = d.Width or d.X
+            local h = d.Height or d.Y
+            if type(w) == "number" and w > 0 then return w * 0.5, h * 0.5, w, h end
+        end
     end
     if Windows and Windows.GetRobloxClientSize then
         local ok, s = pcall(function() return Windows.GetRobloxClientSize() end)
-        if ok and s and s.Width then return s.Width * 0.5, s.Height * 0.5 end
+        if ok and s and s.Width then return s.Width * 0.5, s.Height * 0.5, s.Width, s.Height end
     end
-    return 960, 540
+    if Windows and Windows.GetScreenSize then
+        local ok, s = pcall(function() return Windows.GetScreenSize() end)
+        if ok and s and s.Width then return s.Width * 0.5, s.Height * 0.5, s.Width, s.Height end
+    end
+    return 960, 540, 1920, 1080
 end
 
 local function part_mode()
@@ -4090,28 +4175,55 @@ local function apply_aim(x, y, z, smooth)
 end
 
 local function draw_fov()
+    -- FOV draws whenever Draw FOV is on (does NOT require Enable Aimbot)
     if not chk("aim_drawfov", true) then return end
-    if not chk("aim_en", false) then return end
-    local cx, cy = center()
+    local cx, cy, sw, sh = center()
     local fov = sli("aim_fov", 150)
-    if Drawing.DrawCircle then
-        pcall(function() Drawing.DrawCircle(cx, cy, fov, 1, 1, 1, 0.55, 1.2) end)
-        return
+    if type(fov) ~= "number" or fov < 5 then fov = 150 end
+
+    -- Prefer official Drawing.DrawCircle
+    local drew = false
+    if Drawing and Drawing.DrawCircle then
+        local ok = pcall(function()
+            Drawing.DrawCircle(cx, cy, fov, 1, 1, 1, 0.85, 1.8)
+        end)
+        drew = ok
     end
-    if Drawing.DrawLine then
-        local n, px, py = 48, nil, nil
+    -- Also try global DrawCircle
+    if not drew and type(DrawCircle) == "function" then
+        pcall(function() DrawCircle(cx, cy, fov, 1, 1, 1, 0.85, 1.8) end)
+        drew = true
+    end
+    -- Fallback: polyline ring
+    if Drawing and Drawing.DrawLine then
+        local n, px, py = 64, nil, nil
         for i = 0, n do
             local a = (i / n) * math.pi * 2
             local x = cx + math.cos(a) * fov
             local y = cy + math.sin(a) * fov
-            if px then pcall(function() Drawing.DrawLine(px, py, x, y, 1, 1, 1, 0.45, 1) end) end
+            if px then
+                pcall(function() Drawing.DrawLine(px, py, x, y, 1, 1, 1, 0.7, 1.5) end)
+            end
             px, py = x, y
         end
+    end
+    -- Center cross so you always see FOV is alive
+    if Drawing and Drawing.DrawLine then
+        pcall(function()
+            Drawing.DrawLine(cx - 6, cy, cx + 6, cy, 1, 0.3, 0.3, 0.9, 1)
+            Drawing.DrawLine(cx, cy - 6, cx, cy + 6, 1, 0.3, 0.3, 0.9, 1)
+        end)
+    end
+    if Drawing and Drawing.DrawText then
+        pcall(function()
+            Drawing.DrawText(cx + 8, cy + 8, string.format("FOV %d", fov), 1, 1, 1, 0.8)
+        end)
     end
 end
 
 hooks.on_render(function()
     poll_capture()
+    sync_vk_from_widget()
     set_key_txt()
     draw_fov()
 
