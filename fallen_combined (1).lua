@@ -3286,10 +3286,10 @@ end
 local function nrow(id, label, default, key, cid, col)
     ncheck(id, label, default, key)
     local r,g,b,a = col[1], col[2], col[3], col[4] or 1
-    -- color picker label unique (not empty space) to avoid UI collisions
-    nsafe(function() UIManager.CreateColorPicker(cid, label .. " color", r,g,b,a) end)
+    -- unique cid already separates Mil/Boss; short label + SameLine = square next to checkbox
+    nsafe(function() UIManager.CreateColorPicker(cid, " ", r,g,b,a) end)
     nparent(cid)
-    -- NOT same line: SameLine + two "Box" rows was causing click bleed between Mil/Boss
+    nsame(cid)
 end
 local function nread_color(id, dest)
     if UIManager and UIManager.GetColorPicker then
@@ -3402,6 +3402,165 @@ _G.FallenNPC_CFG = NPC_CFG
 ]]
 ----------------------------------------------------------------
 do
+
+----------------------------------------------------------------
+-- PLAYER CACHE (Blueberry players API is already a live cache;
+-- we mirror it into P_CACHE for aimbot, bone pick, sticky, debug)
+-- hooks.on_rescan + periodic refresh every PLAYER_REFRESH_S
+----------------------------------------------------------------
+local PLAYER_REFRESH_S = 0.05
+local P_CACHE = {
+    -- [address] = {
+    --   addr, name, hp, maxhp, dist,
+    --   hx,hy,hz,  rx,ry,rz,  -- head / root
+    --   bones = { {name,x,y,z}, ... },
+    --   team, friend, self, alive, t
+    -- }
+}
+local P_ORDER = {}
+local p_last_refresh = 0
+local p_debug = "players: init"
+
+local function p_clear_stale(now, max_age)
+    local keep = {}
+    for i = 1, #P_ORDER do
+        local a = P_ORDER[i]
+        local e = P_CACHE[a]
+        if e and (now - (e.t or 0)) <= max_age then
+            keep[#keep + 1] = a
+        else
+            P_CACHE[a] = nil
+        end
+    end
+    P_ORDER = keep
+end
+
+local function p_bone_list(p)
+    local out = {}
+    if p.bones and type(p.bones) == "table" then
+        for i = 1, #p.bones do
+            local b = p.bones[i]
+            if b then
+                local pos = b.position or b.pos
+                local x = pos and (pos.X or pos.x) or b.X or b.x
+                local y = pos and (pos.Y or pos.y) or b.Y or b.y
+                local z = pos and (pos.Z or pos.z) or b.Z or b.z
+                local n = b.name or b.Name or ("bone" .. i)
+                if type(x) == "number" and type(y) == "number" and type(z) == "number" then
+                    out[#out + 1] = { name = n, x = x, y = y, z = z }
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function p_refresh()
+    local now = tick()
+    if not players or not players.get_all then
+        p_debug = "players API missing"
+        return
+    end
+    local ok, list = pcall(function() return players.get_all() end)
+    if not ok or type(list) ~= "table" then
+        p_debug = "get_all failed"
+        return
+    end
+
+    local seen = {}
+    local n = 0
+    for i = 1, #list do
+        local p = list[i]
+        if p and not p.is_self then
+            local addr = p.address or p.player_addr or p.name
+            if addr then
+                local head = p.head_pos
+                local root = p.position
+                local hx = head and (head.X or head.x) or nil
+                local hy = head and (head.Y or head.y) or nil
+                local hz = head and (head.Z or head.z) or nil
+                local rx = root and (root.X or root.x) or hx
+                local ry = root and (root.Y or root.y) or hy
+                local rz = root and (root.Z or root.z) or hz
+                if type(hx) ~= "number" and type(rx) == "number" then
+                    hx, hy, hz = rx, (ry or 0) + 1.5, rz
+                end
+                if type(hx) == "number" then
+                    local e = P_CACHE[addr]
+                    if not e then
+                        e = {}
+                        P_CACHE[addr] = e
+                        P_ORDER[#P_ORDER + 1] = addr
+                    end
+                    e.addr = addr
+                    e.name = p.name or p.display_name or "?"
+                    e.hp = p.health or 0
+                    e.maxhp = p.max_health or 100
+                    e.dist = p.distance or 0
+                    e.hx, e.hy, e.hz = hx, hy, hz
+                    e.rx, e.ry, e.rz = rx or hx, ry or hy, rz or hz
+                    e.bones = p_bone_list(p)
+                    e.team = p.is_teammate and true or false
+                    e.friend = (p.is_friended or p.is_marked_friend or p.is_roblox_friend) and true or false
+                    e.knocked = p.is_knocked and true or false
+                    e.alive = (e.hp or 0) > 0 and not e.knocked
+                    e.t = now
+                    e.raw = p -- keep ref for tool etc
+                    seen[addr] = true
+                    n = n + 1
+                end
+            end
+        end
+    end
+    -- drop players not in this snapshot
+    local keep = {}
+    for i = 1, #P_ORDER do
+        local a = P_ORDER[i]
+        if seen[a] then
+            keep[#keep + 1] = a
+        else
+            P_CACHE[a] = nil
+        end
+    end
+    P_ORDER = keep
+    p_debug = string.format("players: %d cached", n)
+end
+
+local function p_tick()
+    local now = tick()
+    if now - p_last_refresh >= PLAYER_REFRESH_S then
+        p_last_refresh = now
+        pcall(p_refresh)
+        p_clear_stale(now, 1.0)
+    end
+end
+
+-- Blueberry already rescans; mirror on rescan for lower latency
+if hooks and hooks.on_rescan then
+    pcall(function()
+        hooks.on_rescan(function()
+            p_last_refresh = 0
+            pcall(p_refresh)
+        end)
+    end)
+end
+if hooks and hooks.on_player_join then
+    pcall(function()
+        hooks.on_player_join(function()
+            p_last_refresh = 0
+        end)
+    end)
+end
+if hooks and hooks.on_player_leave then
+    pcall(function()
+        hooks.on_player_leave(function(addr)
+            if addr and P_CACHE[addr] then
+                P_CACHE[addr] = nil
+            end
+        end)
+    end)
+end
+
 local AIM = {
     vk = 0,
     capture = false,
@@ -3412,7 +3571,9 @@ local AIM = {
     hz = { id = nil, until_ms = 0, mul = 1, next = 0, ox = 0, oy = 0, oz = 0 },
     last_frame_t = 0,
     frame_dt = 1/60,
-    ping_s = 0.05, -- estimated RTT/2 fallback ~50ms one-way; override via slider
+    ping_s = 0.05,
+    pred_sx = nil, -- visualize predicted aim point
+    pred_sy = nil,
 }
 
 -- Fallen ballistic approx (studs/s, gravity scale). Tuned for long-range lead.
@@ -3537,9 +3698,13 @@ pcall(function() UIManager.CreateSliderInt("aim_range", "Range", 50, 1200, 850) 
 pcall(function() UIManager.CreateSliderInt("aim_fov", "FOV", 20, 500, 150) end); parent("aim_fov")
 pcall(function() UIManager.CreateSliderInt("aim_smooth", "Smooth", 1, 25, 6) end); parent("aim_smooth")
 pcall(function() UIManager.CreateCheckbox("aim_sticky", "Sticky Aim", true) end); parent("aim_sticky")
-pcall(function() UIManager.CreateCheckbox("aim_pred", "Velocity Prediction", true) end); parent("aim_pred")
+pcall(function() UIManager.CreateText("aim_pred_h", "Prediction") end); parent("aim_pred_h")
+pcall(function() UIManager.CreateCheckbox("aim_pred", "Enabled", true) end); parent("aim_pred")
+pcall(function() UIManager.CreateCheckbox("aim_pred_vis", "Visualize Prediction", false) end); parent("aim_pred_vis")
+-- Custom prediction strength 1000..20000 (1000 = 1.0x, 20000 = 20.0x)
+pcall(function() UIManager.CreateSliderInt("aim_pred_x", "Prediction X", 1000, 20000, 1000) end); parent("aim_pred_x")
+pcall(function() UIManager.CreateSliderInt("aim_pred_y", "Prediction Y", 1000, 20000, 1000) end); parent("aim_pred_y")
 pcall(function() UIManager.CreateCheckbox("aim_drop", "Bullet Drop", true) end); parent("aim_drop")
-pcall(function() UIManager.CreateSliderInt("aim_lead", "Lead Scale %", 50, 200, 100) end); parent("aim_lead")
 pcall(function() UIManager.CreateSliderInt("aim_bulletspeed", "Bullet Speed override (0=auto)", 0, 2000, 0) end); parent("aim_bulletspeed")
 pcall(function() UIManager.CreateSliderInt("aim_gravity", "Gravity override (0=auto)", 0, 80, 0) end); parent("aim_gravity")
 pcall(function() UIManager.CreateSliderInt("aim_ping", "Ping ms (latency)", 0, 200, 50) end); parent("aim_ping")
@@ -3547,10 +3712,27 @@ pcall(function() UIManager.CreateCheckbox("aim_use_accel", "Use Acceleration", t
 pcall(function() UIManager.CreateCheckbox("aim_quadratic", "Quadratic Intercept", true) end); parent("aim_quadratic")
 pcall(function() UIManager.CreateCheckbox("aim_human", "Humanize", false) end); parent("aim_human")
 pcall(function() UIManager.CreateCheckbox("aim_drawfov", "Draw FOV", true) end); parent("aim_drawfov")
+pcall(function() UIManager.CreateColorPicker("aim_fov_col", "FOV Color", 1, 1, 1, 0.85) end); parent("aim_fov_col")
+pcall(function() UIManager.SetElementSameLine("aim_fov_col", true) end)
+
 pcall(function() UIManager.CreateCheckbox("aim_team", "Team Check (players)", true) end); parent("aim_team")
-pcall(function() UIManager.CreateCheckbox("aim_mode_mouse", "Use write_mouse", true) end); parent("aim_mode_mouse")
-pcall(function() UIManager.CreateCheckbox("aim_mode_cursor", "Use MoveMouse", true) end); parent("aim_mode_cursor")
-pcall(function() UIManager.CreateCheckbox("aim_mode_cam", "Use camera matrix", true) end); parent("aim_mode_cam")
+
+-- Aim type: Mouse (OS cursor) OR Camera (engine camera matrix)
+pcall(function() UIManager.CreateText("aim_method_h", "Aim Type") end); parent("aim_method_h")
+pcall(function()
+    UIManager.CreateCheckbox("aim_method_mouse", "Mouse Aim (MoveMouse)", true, function(v)
+        if v then
+            pcall(function() UIManager.SetCheckboxValue("aim_method_cam", false) end)
+        end
+    end)
+end); parent("aim_method_mouse")
+pcall(function()
+    UIManager.CreateCheckbox("aim_method_cam", "Camera Aim (set_camera_rotation)", false, function(v)
+        if v then
+            pcall(function() UIManager.SetCheckboxValue("aim_method_mouse", false) end)
+        end
+    end)
+end); parent("aim_method_cam")
 
 local function chk(id, fb)
     local v = nil
@@ -3856,10 +4038,14 @@ local function predict(key, x, y, z)
     local lx, ly, lz = nlocal_xyz()
     if not lx then return x, y, z end
 
-    local lead = sli("aim_lead", 100) / 100
-    local vx = svx * lead
-    local vy = svy * lead
-    local vz = svz * lead
+    -- Prediction X/Y: 1000 = 1.0x, 20000 = 20.0x (horizontal / vertical)
+    local px_s = sli("aim_pred_x", 1000) / 1000
+    local py_s = sli("aim_pred_y", 1000) / 1000
+    if px_s < 0.1 then px_s = 0.1 end
+    if py_s < 0.1 then py_s = 0.1 end
+    local vx = svx * px_s
+    local vy = svy * py_s
+    local vz = svz * px_s  -- lateral Z uses X scale
     local use_accel = chk("aim_use_accel", true)
     local ax = use_accel and (sax * lead) or 0
     local ay = use_accel and (say * lead) or 0
@@ -3954,8 +4140,19 @@ local function predict(key, x, y, z)
 
     -- Bullet drop compensation (aim higher)
     if want_drop and t_flight > 0.001 then
-        -- drop uses flight time of the bullet itself (not extra ping on gravity of target)
         py = py + 0.5 * grav * t_flight * t_flight
+    end
+
+    -- Visualize predicted world point
+    if chk("aim_pred_vis", false) then
+        local sx, sy = w2s(px, py, pz)
+        if sx then
+            AIM.pred_sx, AIM.pred_sy = sx, sy
+        else
+            AIM.pred_sx, AIM.pred_sy = nil, nil
+        end
+    else
+        AIM.pred_sx, AIM.pred_sy = nil, nil
     end
 
     return px, py, pz
@@ -3986,37 +4183,44 @@ local function collect_candidates(lx, ly, lz, fov, range)
     local cx, cy = center()
     local list = {}
 
-    if chk("aim_players", true) and players and players.get_all then
-        local ok, all = pcall(function() return players.get_all() end)
-        if ok and all then
-            for _, p in ipairs(all) do
-                if not p.is_self and (not chk("aim_team", true) or not p.is_teammate) then
-                    if (p.health or 1) > 0 then
-                        local head = p.head_pos or p.position
-                        local root = p.position or p.head_pos
-                        if head then
-                            local hx, hy, hz = head.X or head.x, head.Y or head.y, head.Z or head.z
-                            local rx = (root and (root.X or root.x)) or hx
-                            local ry = (root and (root.Y or root.y)) or hy
-                            local rz = (root and (root.Z or root.z)) or hz
-                            if type(hx) == "number" then
-                                local dist = p.distance or math.sqrt((hx-lx)^2+(hy-ly)^2+(hz-lz)^2)
-                                if dist <= range then
-                                    local bx, by, bz, bn = bone_from_xyz(hx, hy, hz, rx, ry, rz)
-                                    local sx, sy = w2s(bx, by, bz)
-                                    if sx then
-                                        local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
-                                        if fd <= fov then
-                                            list[#list+1] = {
-                                                type = "player",
-                                                id = "p:" .. tostring(p.address or p.name),
-                                                addr = p.address,
-                                                fd = fd, dist = dist,
-                                                x = bx, y = by, z = bz, bone = bn,
-                                            }
-                                        end
-                                    end
+    -- Players from P_CACHE (refreshed on_rescan + every 50ms)
+    if chk("aim_players", true) then
+        p_tick()
+        for i = 1, #P_ORDER do
+            local e = P_CACHE[P_ORDER[i]]
+            if e and e.alive and not e.friend then
+                if not (chk("aim_team", true) and e.team) then
+                    local dist = e.dist
+                    if not dist or dist <= 0 then
+                        dist = math.sqrt((e.hx-lx)^2+(e.hy-ly)^2+(e.hz-lz)^2)
+                    end
+                    if dist <= range then
+                        local hx, hy, hz = e.hx, e.hy, e.hz
+                        local rx, ry, rz = e.rx or hx, e.ry or hy, e.rz or hz
+                        -- prefer real bone from cache if Head/Torso present
+                        if e.bones then
+                            for bi = 1, #e.bones do
+                                local b = e.bones[bi]
+                                local nl = string.lower(b.name or "")
+                                if nl == "head" or nl:find("head", 1, true) then
+                                    hx, hy, hz = b.x, b.y, b.z
+                                elseif nl == "uppertorso" or nl == "torso" or nl == "humanoidrootpart" then
+                                    rx, ry, rz = b.x, b.y, b.z
                                 end
+                            end
+                        end
+                        local bx, by, bz, bn = bone_from_xyz(hx, hy, hz, rx, ry, rz)
+                        local sx, sy = w2s(bx, by, bz)
+                        if sx then
+                            local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
+                            if fd <= fov then
+                                list[#list+1] = {
+                                    type = "player",
+                                    id = "p:" .. tostring(e.addr),
+                                    addr = e.addr,
+                                    fd = fd, dist = dist,
+                                    x = bx, y = by, z = bz, bone = bn,
+                                }
                             end
                         end
                     end
@@ -4062,29 +4266,18 @@ local function pick(lx, ly, lz)
 
     if sticky and AIM.locked then
         local L = AIM.locked
-        if L.type == "player" and L.addr and players and players.get_all then
-            local ok, all = pcall(function() return players.get_all() end)
-            if ok and all then
-                for _, p in ipairs(all) do
-                    if p.address == L.addr and not p.is_self then
-                        local head = p.head_pos or p.position
-                        local root = p.position or head
-                        if head then
-                            local hx, hy, hz = head.X or head.x, head.Y or head.y, head.Z or head.z
-                            local rx = root.X or root.x or hx
-                            local ry = root.Y or root.y or hy
-                            local rz = root.Z or root.z or hz
-                            local dist = p.distance or math.sqrt((hx-lx)^2+(hy-ly)^2+(hz-lz)^2)
-                            if dist <= range then
-                                local bx, by, bz, bn = bone_from_xyz(hx, hy, hz, rx, ry, rz)
-                                local sx, sy = w2s(bx, by, bz)
-                                if sx then
-                                    local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
-                                    if fd <= fov * 1.4 then
-                                        return { type="player", id=L.id or ("p:"..L.addr), addr=L.addr, x=bx,y=by,z=bz, bone=bn, fd=fd, dist=dist }
-                                    end
-                                end
-                            end
+        if L.type == "player" and L.addr then
+            p_tick()
+            local e = P_CACHE[L.addr]
+            if e and e.alive then
+                local dist = e.dist or math.sqrt((e.hx-lx)^2+(e.hy-ly)^2+(e.hz-lz)^2)
+                if dist <= range then
+                    local bx, by, bz, bn = bone_from_xyz(e.hx, e.hy, e.hz, e.rx or e.hx, e.ry or e.hy, e.rz or e.hz)
+                    local sx, sy = w2s(bx, by, bz)
+                    if sx then
+                        local fd = math.sqrt((sx-cx)^2+(sy-cy)^2)
+                        if fd <= fov * 1.4 then
+                            return { type="player", id=L.id or ("p:"..tostring(L.addr)), addr=L.addr, x=bx,y=by,z=bz, bone=bn, fd=fd, dist=dist }
                         end
                     end
                 end
@@ -4121,103 +4314,120 @@ local function pick(lx, ly, lz)
     return best
 end
 
--- Apply aim using official Blueberry paths (recipes 1 + 9)
+--[[
+  Mouse Aim  = OS cursor emulation: Windows.MoveMouse toward target screen pos
+               (game camera follows the physical/system cursor)
+  Camera Aim = engine camera: aim.look_at_matrix + aim.set_camera_rotation
+               (direct view matrix, no cursor move)
+]]
 local function apply_aim(x, y, z, smooth)
     smooth = math.max(1, smooth or 6)
-    local sx, sy = w2s(x, y, z)
-    if not sx then return false end
 
-    local did = false
+    local use_cam = chk("aim_method_cam", false)
+    local use_mouse = chk("aim_method_mouse", true)
+    if use_cam then use_mouse = false end
+    if not use_cam and not use_mouse then use_mouse = true end
 
-    -- Recipe 9: physical cursor (camera turns)
-    if chk("aim_mode_cursor", true) and Windows and Windows.GetMousePos and Windows.MoveMouse then
+    -- ===== MOUSE AIM =====
+    if use_mouse then
+        local sx, sy = w2s(x, y, z)
+        if not sx then return false end
+        if not (Windows and Windows.GetMousePos and Windows.MoveMouse) then return false end
         local ok, mp = pcall(function() return Windows.GetMousePos() end)
-        if ok and mp and mp.X then
-            local t = 1 / smooth
-            local nx = mp.X + (sx - mp.X) * t
-            local ny = mp.Y + (sy - mp.Y) * t
+        if not ok or not mp or not mp.X then return false end
+        local t = 1 / smooth
+        local nx = mp.X + (sx - mp.X) * t
+        local ny = mp.Y + (sy - mp.Y) * t
+        -- Prefer client-area coords if available
+        if Windows.MoveMouseInRoblox then
+            pcall(function() Windows.MoveMouseInRoblox(nx, ny) end)
+        else
             pcall(function() Windows.MoveMouse(nx, ny) end)
-            did = true
+        end
+        return true
+    end
+
+    -- ===== CAMERA AIM =====
+    if not (aim and aim.look_at_matrix and aim.set_camera_rotation and aim.get_camera_position) then
+        return false
+    end
+    local ok, cpos = pcall(function() return aim.get_camera_position() end)
+    if not ok or not cpos then return false end
+    local ok2, m = pcall(function() return aim.look_at_matrix(cpos, v3(x, y, z)) end)
+    if not ok2 or not m then return false end
+
+    if smooth <= 1 then
+        pcall(function() aim.set_camera_rotation(m) end)
+        return true
+    end
+    local ok3, cur = pcall(function() return aim.get_camera_rotation() end)
+    if ok3 and cur then
+        local t = 1 / smooth
+        local out = {}
+        for i = 1, 9 do
+            out[i] = (cur[i] or 0) + ((m[i] or 0) - (cur[i] or 0)) * t
+        end
+        pcall(function() aim.set_camera_rotation(out) end)
+    else
+        pcall(function() aim.set_camera_rotation(m) end)
+    end
+    return true
+end
+
+local function fov_color()
+    local r, g, b, a = 1, 1, 1, 0.85
+    if UIManager and UIManager.GetColorPickerValue then
+        local c = nsafe(function() return UIManager.GetColorPickerValue("aim_fov_col") end, nil)
+        if c then
+            r = c.r or c.R or c[1] or r
+            g = c.g or c.G or c[2] or g
+            b = c.b or c.B or c[3] or b
+            a = c.a or c.A or c[4] or a
+            if r > 1 then r = r / 255 end
+            if g > 1 then g = g / 255 end
+            if b > 1 then b = b / 255 end
+            if a > 1 then a = a / 255 end
         end
     end
-
-    -- Recipe 1: write_mouse into MouseService
-    if chk("aim_mode_mouse", true) and aim and aim.write_mouse then
-        pcall(function() aim.write_mouse({ X = sx, Y = sy }) end)
-        did = true
-    end
-
-    -- Camera matrix fallback
-    if chk("aim_mode_cam", true) and aim and aim.look_at_matrix and aim.set_camera_rotation and aim.get_camera_position then
-        local ok, cpos = pcall(function() return aim.get_camera_position() end)
-        if ok and cpos then
-            local ok2, m = pcall(function() return aim.look_at_matrix(cpos, v3(x, y, z)) end)
-            if ok2 and m then
-                if smooth <= 2 then
-                    pcall(function() aim.set_camera_rotation(m) end)
-                else
-                    local ok3, cur = pcall(function() return aim.get_camera_rotation() end)
-                    if ok3 and cur then
-                        local t = 1 / smooth
-                        local out = {}
-                        for i = 1, 9 do out[i] = (cur[i] or 0) + ((m[i] or 0) - (cur[i] or 0)) * t end
-                        pcall(function() aim.set_camera_rotation(out) end)
-                    else
-                        pcall(function() aim.set_camera_rotation(m) end)
-                    end
-                end
-                did = true
-            end
-        end
-    end
-
-    return did
+    return r, g, b, a
 end
 
 local function draw_fov()
-    -- FOV draws whenever Draw FOV is on (does NOT require Enable Aimbot)
     if not chk("aim_drawfov", true) then return end
-    local cx, cy, sw, sh = center()
+    local cx, cy = center()
     local fov = sli("aim_fov", 150)
     if type(fov) ~= "number" or fov < 5 then fov = 150 end
+    local r, g, b, a = fov_color()
 
-    -- Prefer official Drawing.DrawCircle
-    local drew = false
     if Drawing and Drawing.DrawCircle then
-        local ok = pcall(function()
-            Drawing.DrawCircle(cx, cy, fov, 1, 1, 1, 0.85, 1.8)
-        end)
-        drew = ok
+        pcall(function() Drawing.DrawCircle(cx, cy, fov, r, g, b, a, 1.8) end)
+    elseif type(DrawCircle) == "function" then
+        pcall(function() DrawCircle(cx, cy, fov, r, g, b, a, 1.8) end)
     end
-    -- Also try global DrawCircle
-    if not drew and type(DrawCircle) == "function" then
-        pcall(function() DrawCircle(cx, cy, fov, 1, 1, 1, 0.85, 1.8) end)
-        drew = true
-    end
-    -- Fallback: polyline ring
+    -- ring fallback only (no crosshair, no FOV text)
     if Drawing and Drawing.DrawLine then
         local n, px, py = 64, nil, nil
         for i = 0, n do
-            local a = (i / n) * math.pi * 2
-            local x = cx + math.cos(a) * fov
-            local y = cy + math.sin(a) * fov
+            local ang = (i / n) * math.pi * 2
+            local x = cx + math.cos(ang) * fov
+            local y = cy + math.sin(ang) * fov
             if px then
-                pcall(function() Drawing.DrawLine(px, py, x, y, 1, 1, 1, 0.7, 1.5) end)
+                pcall(function() Drawing.DrawLine(px, py, x, y, r, g, b, a, 1.5) end)
             end
             px, py = x, y
         end
     end
-    -- Center cross so you always see FOV is alive
-    if Drawing and Drawing.DrawLine then
-        pcall(function()
-            Drawing.DrawLine(cx - 6, cy, cx + 6, cy, 1, 0.3, 0.3, 0.9, 1)
-            Drawing.DrawLine(cx, cy - 6, cx, cy + 6, 1, 0.3, 0.3, 0.9, 1)
-        end)
-    end
-    if Drawing and Drawing.DrawText then
-        pcall(function()
-            Drawing.DrawText(cx + 8, cy + 8, string.format("FOV %d", fov), 1, 1, 1, 0.8)
-        end)
+end
+
+local function draw_pred_vis()
+    if not chk("aim_pred_vis", false) then return end
+    if not AIM.pred_sx then return end
+    local sx, sy = AIM.pred_sx, AIM.pred_sy
+    if Drawing and Drawing.DrawCircle then
+        pcall(function() Drawing.DrawCircle(sx, sy, 5, 1, 0.2, 0.2, 0.95, 1.5) end)
+        pcall(function() Drawing.DrawCircle(sx, sy, 2, 1, 0.4, 0.4, 1, 1) end)
+    elseif Drawing and Drawing.DrawCircleFilled then
+        pcall(function() Drawing.DrawCircleFilled(sx, sy, 4, 1, 0.2, 0.2, 0.9) end)
     end
 end
 
@@ -4226,6 +4436,13 @@ hooks.on_render(function()
     sync_vk_from_widget()
     set_key_txt()
     draw_fov()
+    draw_pred_vis()
+    p_tick()
+    if Drawing and Drawing.DrawText then
+        pcall(function()
+            Drawing.DrawText(12, 40, p_debug .. " | npc:" .. tostring(#npc_order), 0.7, 0.9, 0.7, 0.85)
+        end)
+    end
 
     if not chk("aim_en", false) then
         AIM.locked = nil
