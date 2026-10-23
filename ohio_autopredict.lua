@@ -1,145 +1,363 @@
 --[[
-  Ohio AUTO-PREDICT Mouse Aimbot
-  Project Vector — NATIVE menu only (menu.Add*)
-  No custom draw UI — opens inside Vector menu
+  Ohio AUTO-PREDICT — Project Vector
+  Custom UI ported from Infernal patterns:
+    draw.rect_filled(x,y,w,h,col,rounding)
+    draw.text(x,y,str,col,size)
+    utility.get_mouse_pos / input.get_mouse_position
+    input.is_key_down(0x01) + edge click
+    panel drag on title bar only
+  Toggle: F8
 ]]
 
 --------------------------------------------------------------------------------
--- NATIVE MENU (Vector docs)
+-- CONFIG
 --------------------------------------------------------------------------------
-local function mcall(pascal, snake, ...)
-    if menu[pascal] then return menu[pascal](...) end
-    if menu[snake] then return menu[snake](...) end
-end
+local CFG = {
+    aim_on = false,
+    aim_vk = 0x02,
+    fov = 200,
+    smooth = 0.30,
+    range = 1200,
+    bone = 0,
+    sticky = true,
+    pred_on = true,
+    pred_strength = 1.15,
+    ping_ms = 55,
+    drop_on = true,
+    drop_strength = 0.80,
+    speed_override = 0,
+    draw_fov = true,
+    draw_pred = true,
+}
 
-mcall("AddTab", "add_tab", "Ohio", "O")
-mcall("AddGroup", "add_group", "Ohio", "Aimbot")
-mcall("AddCheckbox", "add_checkbox", "Ohio", "Aimbot", "aim_on", "Enable Aimbot", false)
-mcall("AddHotkey", "add_hotkey", "Ohio", "Aimbot", "aim_key", "Aim Key", 0x02)
-mcall("AddSliderInt", "add_slider_int", "Ohio", "Aimbot", "fov", "FOV", 20, 800, 200)
-mcall("AddSliderFloat", "add_slider_float", "Ohio", "Aimbot", "smooth", "Smooth", 0.05, 1.0, 0.30)
-mcall("AddSliderInt", "add_slider_int", "Ohio", "Aimbot", "range", "Range", 50, 2000, 1200)
-mcall("AddCombo", "add_combo", "Ohio", "Aimbot", "bone", "Bone", {"Head", "Torso", "Closest"}, 0)
-mcall("AddCheckbox", "add_checkbox", "Ohio", "Aimbot", "sticky", "Sticky Aim", true)
-
-mcall("AddGroup", "add_group", "Ohio", "Predict")
-mcall("AddCheckbox", "add_checkbox", "Ohio", "Predict", "pred_on", "Auto Predict", true)
-mcall("AddSliderFloat", "add_slider_float", "Ohio", "Predict", "pred_strength", "Strength", 0.5, 2.5, 1.15)
-mcall("AddSliderInt", "add_slider_int", "Ohio", "Predict", "ping_ms", "Ping ms", 0, 250, 55)
-mcall("AddCheckbox", "add_checkbox", "Ohio", "Predict", "drop_on", "Bullet Drop", true)
-mcall("AddSliderFloat", "add_slider_float", "Ohio", "Predict", "drop_strength", "Drop Strength", 0.0, 2.5, 0.80)
-mcall("AddSliderInt", "add_slider_int", "Ohio", "Predict", "speed_override", "Bullet Speed (0=AUTO)", 0, 3500, 0)
-
-mcall("AddGroup", "add_group", "Ohio", "Visual")
-mcall("AddCheckbox", "add_checkbox", "Ohio", "Visual", "draw_fov", "Draw FOV", true)
-mcall("AddCheckbox", "add_checkbox", "Ohio", "Visual", "draw_pred", "Show Pred Point", true)
-
---------------------------------------------------------------------------------
-local function mg(id, fb)
-    local v
-    if menu.Get then
-        local ok, r = pcall(menu.Get, id)
-        if ok and r ~= nil then return r end
-    end
-    if menu.get then
-        local ok, r = pcall(menu.get, id)
-        if ok and r ~= nil then return r end
-    end
-    return fb
-end
-
-local function try(fn, ...)
-    if type(fn) ~= "function" then return nil end
-    local ok, a, b, c = pcall(fn, ...)
-    if ok then return a, b, c end
-    return nil
-end
+local UI = {
+    open = true,
+    x = 60, y = 60, w = 320, h = 420,
+    dragging = false,
+    off_x = 0, off_y = 0,
+    tab = 1,
+    waiting_key = false,
+    wait_lmb_up = false,
+}
 
 local hist, sticky_id = {}, nil
+local prev_lmb, prev_f8 = false, false
+local mx, my, lmb, lmb_click = 0, 0, false, false
 
-local function is_key(vk)
+--------------------------------------------------------------------------------
+-- INPUT (Infernal-style)
+--------------------------------------------------------------------------------
+local function update_input()
+    mx, my = 0, 0
+    local util_mouse = utility and (utility.get_mouse_pos or utility.GetMousePos)
+    local input_mouse = input and (input.get_mouse_pos or input.get_mouse_position or input.GetMousePosition)
+    if util_mouse then
+        local a, b = util_mouse()
+        mx, my = tonumber(a) or 0, tonumber(b) or 0
+    elseif input_mouse then
+        local a, b = input_mouse()
+        mx, my = tonumber(a) or 0, tonumber(b) or 0
+    end
+
+    local key_fn = input and (input.is_key_down or input.IsKeyDown)
+    lmb = key_fn and key_fn(0x01) == true or false
+    lmb_click = lmb and not prev_lmb
+    prev_lmb = lmb
+end
+
+local function key_down(vk)
     if not vk then return false end
-    if input and input.IsKeyDown then
-        local r = try(input.IsKeyDown, vk)
-        if r == true then return true end
-    end
-    return false
+    local fn = input and (input.is_key_down or input.IsKeyDown)
+    return fn and fn(vk) == true or false
 end
 
-local function aim_held()
-    -- native hotkey
-    if menu.IsHotkeyDown then
-        local r = try(menu.IsHotkeyDown, "aim_key")
-        if r == true then return true end
-    end
-    if menu.IsHotkeyActive then
-        local r = try(menu.IsHotkeyActive, "aim_key")
-        if r == true then return true end
-    end
-    local vk = 0x02
-    if menu.GetKey then
-        local k = try(menu.GetKey, "aim_key")
-        if type(k) == "number" and k > 0 then vk = k end
-    end
-    return is_key(vk)
+local function hover(x, y, w, h)
+    return mx >= x and my >= y and mx <= x + w and my <= y + h
 end
 
-local function mouse_pos()
-    if input and input.GetMousePosition then
-        local x, y = try(input.GetMousePosition)
-        if type(x) == "number" then return x, y end
+local function clicked(x, y, w, h)
+    return lmb_click and hover(x, y, w, h)
+end
+
+--------------------------------------------------------------------------------
+-- DRAW (Infernal signatures)
+--------------------------------------------------------------------------------
+local function rect_filled(x, y, w, h, col, rounding)
+    if not draw then return end
+    rounding = rounding or 0
+    local fn = draw.rect_filled or draw.RectFilled or draw.filled_rect
+    if fn then
+        pcall(fn, x, y, w, h, col, rounding)
+        return
     end
-    if utility and utility.GetMousePos then
-        local x, y = try(utility.GetMousePos)
-        if type(x) == "number" then return x, y end
+    if draw.box then pcall(draw.box, x, y, w, h, col) end
+end
+
+local function rect_outline(x, y, w, h, col, rounding)
+    if not draw then return end
+    local fn = draw.rect or draw.Rect
+    if fn then pcall(fn, x, y, w, h, col, rounding or 0, 1) end
+end
+
+local function text(x, y, str, col, size)
+    if not draw then return end
+    size = size or 13
+    local fn = draw.text or draw.Text
+    if fn then pcall(fn, x, y, tostring(str), col, size) end
+end
+
+local function circle(x, y, r, col, filled)
+    if not draw then return end
+    if filled then
+        local fn = draw.circle_filled or draw.CircleFilled
+        if fn then pcall(fn, x, y, r, col, 20) return end
     end
-    return 0, 0
+    local fn = draw.circle or draw.Circle
+    if fn then pcall(fn, x, y, r, col, 24, 1) end
+end
+
+local function screen_size()
+    local fn = (draw and (draw.get_screen_size or draw.GetScreenSize))
+            or (utility and (utility.get_screen_size or utility.GetScreenSize))
+    if fn then
+        local w, h = fn()
+        if w then return w, h end
+    end
+    return 1920, 1080
 end
 
 local function screen_center()
-    if input and input.GetScreenCenter then
-        local x, y = try(input.GetScreenCenter)
+    local fn = input and (input.get_screen_center or input.GetScreenCenter)
+    if fn then
+        local x, y = fn()
         if x then return x, y end
     end
-    if draw and draw.GetScreenSize then
-        local w, h = try(draw.GetScreenSize)
-        if w then return w * 0.5, h * 0.5 end
-    end
-    if utility and utility.GetScreenSize then
-        local w, h = try(utility.GetScreenSize)
-        if w then return w * 0.5, h * 0.5 end
-    end
-    return 960, 540
+    local w, h = screen_size()
+    return w * 0.5, h * 0.5
 end
 
 local function w2s(x, y, z)
-    if draw and draw.WorldToScreen then
-        local sx, sy, ok = try(draw.WorldToScreen, x, y, z)
-        if type(sx) == "number" and ok ~= false then return sx, sy end
-    end
-    if utility and utility.WorldToScreen then
-        local sx, sy, ok = try(utility.WorldToScreen, x, y, z)
-        if type(sx) == "number" and ok ~= false then return sx, sy end
-    end
+    local fn = (draw and (draw.world_to_screen or draw.WorldToScreen))
+            or (utility and (utility.world_to_screen or utility.WorldToScreen))
+    if not fn then return nil, nil end
+    local sx, sy, ok = fn(x, y, z)
+    if type(sx) == "number" and ok ~= false then return sx, sy end
     return nil, nil
 end
 
 local function move_mouse(dx, dy)
     if math.abs(dx) < 0.05 and math.abs(dy) < 0.05 then return end
-    if input and input.MoveMouse then try(input.MoveMouse, dx, dy) return end
-    if utility and utility.MouseMove then try(utility.MouseMove, dx, dy) return end
+    local fn = (input and (input.move_mouse or input.MoveMouse))
+            or (utility and (utility.mouse_move or utility.MouseMove))
+    if fn then pcall(fn, dx, dy) end
 end
 
+--------------------------------------------------------------------------------
+-- UI WIDGETS
+--------------------------------------------------------------------------------
+local ACCENT = { 0.25, 0.75, 1.0, 1 }
+local BG = { 0.07, 0.07, 0.09, 0.96 }
+local BG2 = { 0.12, 0.12, 0.15, 1 }
+local TEXT = { 0.92, 0.92, 0.95, 1 }
+local MUTED = { 0.55, 0.58, 0.62, 1 }
+
+local function ui_checkbox(x, y, label, key)
+    local on = CFG[key]
+    rect_filled(x, y, 16, 16, BG2, 3)
+    rect_outline(x, y, 16, 16, { 0.4, 0.4, 0.45, 1 }, 3)
+    if on then rect_filled(x + 3, y + 3, 10, 10, ACCENT, 2) end
+    text(x + 24, y + 1, label, TEXT, 13)
+    if clicked(x, y, 240, 18) then
+        CFG[key] = not CFG[key]
+    end
+    return y + 26
+end
+
+local function ui_slider(x, y, w, label, key, mn, mx, is_float)
+    local val = CFG[key]
+    if type(val) ~= "number" then val = mn end
+    local t = (val - mn) / (mx - mn)
+    if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    local disp = is_float and string.format("%s  %.2f", label, val)
+                          or string.format("%s  %d", label, math.floor(val + 0.5))
+    text(x, y, disp, TEXT, 13)
+    local sy = y + 17
+    rect_filled(x, sy, w, 12, BG2, 3)
+    rect_filled(x, sy, math.max(2, w * t), 12, ACCENT, 3)
+    rect_outline(x, sy, w, 12, { 0.35, 0.35, 0.4, 1 }, 3)
+    if lmb and hover(x, sy - 2, w, 16) then
+        local nt = (mx - x) / w
+        if nt < 0 then nt = 0 elseif nt > 1 then nt = 1 end
+        local nv = mn + nt * (mx - mn)
+        -- fix: use mxv not mx
+        nv = mn + nt * (mx - mn)
+    end
+    -- CORRECT max is parameter mx - shadowing mouse mx! fix below in call site
+    return y + 40, sy, w, mn, mx, is_float, key
+end
+
+-- fixed slider without variable shadow
+local function ui_slider2(x, y, width, label, key, mn, mxv, is_float)
+    local val = CFG[key]
+    if type(val) ~= "number" then val = mn end
+    local t = (val - mn) / (mxv - mn)
+    if t < 0 then t = 0 elseif t > 1 then t = 1 end
+    local disp = is_float and string.format("%s  %.2f", label, val)
+                          or string.format("%s  %d", label, math.floor(val + 0.5))
+    text(x, y, disp, TEXT, 13)
+    local sy = y + 17
+    rect_filled(x, sy, width, 12, BG2, 3)
+    rect_filled(x, sy, math.max(2, width * t), 12, ACCENT, 3)
+    rect_outline(x, sy, width, 12, { 0.35, 0.35, 0.4, 1 }, 3)
+    if lmb and hover(x, sy - 2, width, 16) then
+        local nt = (mx - x) / width
+        if nt < 0 then nt = 0 elseif nt > 1 then nt = 1 end
+        local nv = mn + nt * (mxv - mn)
+        CFG[key] = is_float and nv or math.floor(nv + 0.5)
+    end
+    return y + 40
+end
+
+local function ui_bone(x, y)
+    text(x, y, "Bone", TEXT, 13)
+    local names = { "Head", "Torso", "Closest" }
+    local bx = x
+    for i, n in ipairs(names) do
+        local sel = CFG.bone == (i - 1)
+        rect_filled(bx, y + 16, 78, 22, sel and { 0.15, 0.45, 0.75, 1 } or BG2, 4)
+        rect_outline(bx, y + 16, 78, 22, { 0.4, 0.4, 0.45, 1 }, 4)
+        text(bx + 14, y + 20, n, TEXT, 12)
+        if clicked(bx, y + 16, 78, 22) then CFG.bone = i - 1 end
+        bx = bx + 84
+    end
+    return y + 48
+end
+
+local VKN = {
+    [0x01] = "LMB", [0x02] = "RMB", [0x04] = "MMB",
+    [0x05] = "M4", [0x06] = "M5",
+    [0x10] = "SHIFT", [0x11] = "CTRL", [0x12] = "ALT",
+    [0x20] = "SPACE", [0x09] = "TAB",
+}
+for i = 0x30, 0x39 do VKN[i] = string.char(i) end
+for i = 0x41, 0x5A do VKN[i] = string.char(i) end
+
+local function ui_keybind(x, y)
+    text(x, y, "Aim Key", TEXT, 13)
+    local lab = UI.waiting_key and "PRESS KEY..." or (VKN[CFG.aim_vk] or string.format("%X", CFG.aim_vk))
+    local bx, by, bw, bh = x + 90, y - 2, 140, 22
+    rect_filled(bx, by, bw, bh, UI.waiting_key and { 0.55, 0.25, 0.1, 1 } or BG2, 4)
+    rect_outline(bx, by, bw, bh, { 0.4, 0.4, 0.45, 1 }, 4)
+    text(bx + 12, by + 4, lab, TEXT, 12)
+
+    if clicked(bx, by, bw, bh) then
+        UI.waiting_key = true
+        UI.wait_lmb_up = true  -- Infernal: ignore until LMB released
+    end
+
+    if UI.waiting_key then
+        if UI.wait_lmb_up then
+            if not lmb then UI.wait_lmb_up = false end
+        else
+            local scan = { 0x02, 0x04, 0x05, 0x06, 0x10, 0x11, 0x12, 0x20, 0x09 }
+            for i = 0x30, 0x39 do scan[#scan + 1] = i end
+            for i = 0x41, 0x5A do scan[#scan + 1] = i end
+            -- also allow LMB as bind after release
+            scan[#scan + 1] = 0x01
+            for _, vk in ipairs(scan) do
+                if key_down(vk) then
+                    CFG.aim_vk = vk
+                    UI.waiting_key = false
+                    break
+                end
+            end
+        end
+    end
+    return y + 30
+end
+
+local function ui_tab(x, y, idx, name)
+    local sel = UI.tab == idx
+    rect_filled(x, y, 92, 24, sel and { 0.14, 0.4, 0.7, 1 } or BG2, 4)
+    rect_outline(x, y, 92, 24, { 0.35, 0.35, 0.4, 1 }, 4)
+    text(x + 26, y + 5, name, TEXT, 12)
+    if clicked(x, y, 92, 24) then UI.tab = idx end
+end
+
+local function draw_ui()
+    -- watermark
+    text(10, 10, "Ohio AP | F8 menu | AIM:" .. (CFG.aim_on and "ON" or "off"), { 0.3, 1, 0.55, 1 }, 13)
+
+    if not UI.open then return end
+
+    local x, y, w, h = UI.x, UI.y, UI.w, UI.h
+    local title_h = 30
+
+    -- DRAG title bar only (Infernal panel_drag)
+    if lmb_click and hover(x, y, w, title_h) and not UI.waiting_key then
+        UI.dragging = true
+        UI.off_x = mx - x
+        UI.off_y = my - y
+    end
+    if UI.dragging then
+        if lmb then
+            local sw, sh = screen_size()
+            UI.x = math.max(0, math.min(sw - w, math.floor(mx - UI.off_x)))
+            UI.y = math.max(0, math.min(sh - h, math.floor(my - UI.off_y)))
+            x, y = UI.x, UI.y
+        else
+            UI.dragging = false
+        end
+    end
+
+    -- panel
+    rect_filled(x, y, w, h, BG, 6)
+    rect_outline(x, y, w, h, ACCENT, 6)
+    rect_filled(x, y, w, title_h, { 0.09, 0.18, 0.32, 1 }, 6)
+    text(x + 12, y + 7, "OHIO AUTO-PREDICT", TEXT, 14)
+    text(x + w - 70, y + 8, "F8", MUTED, 12)
+
+    local ty = y + 40
+    ui_tab(x + 12, ty, 1, "Aim")
+    ui_tab(x + 110, ty, 2, "Predict")
+    ui_tab(x + 208, ty, 3, "Visual")
+
+    local cy = ty + 36
+    local lx, sw = x + 14, w - 28
+
+    if UI.tab == 1 then
+        cy = ui_checkbox(lx, cy, "Enable Aimbot", "aim_on")
+        cy = ui_keybind(lx, cy)
+        cy = ui_slider2(lx, cy, sw, "FOV", "fov", 20, 800, false)
+        cy = ui_slider2(lx, cy, sw, "Smooth", "smooth", 0.05, 1.0, true)
+        cy = ui_slider2(lx, cy, sw, "Range", "range", 50, 2000, false)
+        cy = ui_bone(lx, cy)
+        cy = ui_checkbox(lx, cy, "Sticky Aim", "sticky")
+    elseif UI.tab == 2 then
+        cy = ui_checkbox(lx, cy, "Auto Predict", "pred_on")
+        cy = ui_slider2(lx, cy, sw, "Predict Strength", "pred_strength", 0.5, 2.5, true)
+        cy = ui_slider2(lx, cy, sw, "Ping ms", "ping_ms", 0, 250, false)
+        cy = ui_checkbox(lx, cy, "Bullet Drop", "drop_on")
+        cy = ui_slider2(lx, cy, sw, "Drop Strength", "drop_strength", 0.0, 2.5, true)
+        cy = ui_slider2(lx, cy, sw, "Bullet Speed (0=AUTO)", "speed_override", 0, 3500, false)
+    else
+        cy = ui_checkbox(lx, cy, "Draw FOV", "draw_fov")
+        cy = ui_checkbox(lx, cy, "Show Predict Point", "draw_pred")
+        text(lx, cy + 6, "Drag window by title bar", MUTED, 12)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- AIM / PREDICT
+--------------------------------------------------------------------------------
 local function v3(v)
     if not v then return nil end
-    local x, y, z = v.X or v.x, v.Y or v.y, v.Z or v.z
-    if type(x) ~= "number" then return nil end
-    return x, y, z
+    local a, b, c = v.X or v.x, v.Y or v.y, v.Z or v.z
+    if type(a) ~= "number" then return nil end
+    return a, b, c
 end
 
-local function len3(x, y, z)
-    return math.sqrt(x * x + y * y + z * z)
-end
+local function len3(x, y, z) return math.sqrt(x * x + y * y + z * z) end
 
 local function now()
     if type(tick) == "function" then return tick() end
@@ -158,9 +376,7 @@ local function get_local()
     return nil
 end
 
-local function pid(p)
-    return p.Address or p.UserId or p.Name or p.name or tostring(p)
-end
+local function pid(p) return p.Address or p.UserId or p.Name or p.name or tostring(p) end
 
 local function is_enemy(p)
     if p.IsLocal or p.is_local then return false end
@@ -168,25 +384,8 @@ local function is_enemy(p)
     return true
 end
 
-local function d_circle(x, y, r, c, fill)
-    if not draw then return end
-    if fill and draw.CircleFilled then pcall(draw.CircleFilled, x, y, r, c) return end
-    if draw.Circle then pcall(draw.Circle, x, y, r, c)
-    elseif draw.circle then pcall(draw.circle, x, y, r, c) end
-end
-
-local function d_text(x, y, s, c)
-    if not draw then return end
-    if draw.Text then pcall(draw.Text, x, y, tostring(s), c)
-    elseif draw.text then pcall(draw.text, x, y, tostring(s), c) end
-end
-
---------------------------------------------------------------------------------
--- PREDICT
---------------------------------------------------------------------------------
 local function auto_speed(dist)
-    local ov = mg("speed_override", 0)
-    if type(ov) == "number" and ov > 0 then return ov end
+    if CFG.speed_override and CFG.speed_override > 0 then return CFG.speed_override end
     if dist < 80 then return 1150
     elseif dist < 160 then return 1400
     elseif dist < 300 then return 1650
@@ -217,9 +416,7 @@ local function velocity_of(p, id, x, y, z)
         dvz = (h.dvz or dvz) * (1 - k) + dvz * k
     end
     hist[id] = { x = x, y = y, z = z, t = t, dvx = dvx, dvy = dvy, dvz = dvz }
-    if live then
-        return lvx * 0.72 + dvx * 0.28, lvy * 0.72 + dvy * 0.28, lvz * 0.72 + dvz * 0.28
-    end
+    if live then return lvx * 0.72 + dvx * 0.28, lvy * 0.72 + dvy * 0.28, lvz * 0.72 + dvz * 0.28 end
     return dvx, dvy, dvz
 end
 
@@ -250,26 +447,26 @@ local function intercept_t(ox, oy, oz, px, py, pz, vx, vy, vz, speed)
 end
 
 local function predict_point(p, id, hx, hy, hz, lx, ly, lz)
-    if not mg("pred_on", true) then return hx, hy, hz end
+    if not CFG.pred_on then return hx, hy, hz end
     local vx, vy, vz = velocity_of(p, id, hx, hy, hz)
     local dist = len3(hx - lx, hy - ly, hz - lz)
     local speed = auto_speed(dist)
-    local str = mg("pred_strength", 1.15) or 1.15
+    local str = CFG.pred_strength or 1.15
     vx, vy, vz = vx * str, vy * str, vz * str
-    local t = intercept_t(lx, ly, lz, hx, hy, hz, vx, vy, vz, speed) + (mg("ping_ms", 55) or 55) / 1000
+    local t = intercept_t(lx, ly, lz, hx, hy, hz, vx, vy, vz, speed) + (CFG.ping_ms or 55) / 1000
     local px, py, pz = hx + vx * t, hy + vy * t, hz + vz * t
-    if mg("drop_on", true) then
-        py = py + 0.5 * 130 * t * t * (mg("drop_strength", 0.8) or 0.8)
+    if CFG.drop_on then
+        py = py + 0.5 * 130 * t * t * (CFG.drop_strength or 0.8)
     end
     return px, py, pz
 end
 
 local function bone_world(p)
-    local mode = mg("bone", 0) or 0
     local hx, hy, hz = v3(p.HeadPosition)
     local rx, ry, rz = v3(p.Position)
     if not hx and rx then hx, hy, hz = rx, ry + 1.55, rz end
     if not hx then return nil end
+    local mode = CFG.bone or 0
     if mode == 1 then
         if rx then return rx, ry + 0.55, rz end
         return hx, hy - 0.55, hz
@@ -302,20 +499,15 @@ local function local_pos()
         x, y, z = v3(lp.Position)
         if x then return x, y, z end
     end
-    if camera and camera.GetPosition then
-        local p = try(camera.GetPosition)
-        if p then local x, y, z = v3(p); if x then return x, y, z end end
-    end
     return nil
 end
 
 local function pick_target(lx, ly, lz)
-    local fov = mg("fov", 200) or 200
-    local maxr = mg("range", 1200) or 1200
+    local fov, maxr = CFG.fov or 200, CFG.range or 1200
     local cx, cy = screen_center()
     local list = get_players()
 
-    if mg("sticky", true) and sticky_id then
+    if CFG.sticky and sticky_id then
         for _, p in ipairs(list) do
             if is_enemy(p) and pid(p) == sticky_id then
                 local x, y, z = bone_world(p)
@@ -351,25 +543,35 @@ end
 
 --------------------------------------------------------------------------------
 function OnFrame()
-    -- watermark so you know script runs
-    d_text(10, 10, "Ohio AP | open Vector menu -> Ohio tab", { 0.3, 1, 0.5, 1 })
+    update_input()
 
-    if not mg("aim_on", false) then
+    -- F8 toggle
+    local f8 = key_down(0x77)
+    if f8 and not prev_f8 then
+        UI.open = not UI.open
+    end
+    prev_f8 = f8
+
+    draw_ui()
+
+    if not CFG.aim_on then
         sticky_id = nil
         return
     end
 
     local cx, cy = screen_center()
-    local fov = mg("fov", 200) or 200
-
-    if mg("draw_fov", true) then
-        d_circle(cx, cy, fov, { 1, 1, 1, 0.4 }, false)
+    if CFG.draw_fov then
+        circle(cx, cy, CFG.fov or 200, { 1, 1, 1, 0.35 }, false)
     end
 
-    if not aim_held() then
+    if not key_down(CFG.aim_vk) then
         sticky_id = nil
         return
     end
+
+    -- don't aim while using UI
+    if UI.open and hover(UI.x, UI.y, UI.w, UI.h) then return end
+    if UI.waiting_key or UI.dragging then return end
 
     local lx, ly, lz = local_pos()
     if not lx then return end
@@ -381,17 +583,16 @@ function OnFrame()
     local sx, sy = w2s(px, py, pz)
     if not sx then return end
 
-    if mg("draw_pred", true) then
-        d_circle(sx, sy, 4, { 1, 0.2, 0.2, 0.95 }, true)
+    if CFG.draw_pred then
+        circle(sx, sy, 4, { 1, 0.2, 0.2, 0.95 }, true)
     end
 
-    local sm = mg("smooth", 0.30) or 0.30
+    local sm = CFG.smooth or 0.30
     if sm < 0.05 then sm = 0.05 end
-    local mx, my = mouse_pos()
     move_mouse((sx - mx) * sm, (sy - my) * sm)
 end
 
 on_frame = OnFrame
 onFrame = OnFrame
 
-print("[Ohio] Native menu loaded — open CHEAT MENU, tab: Ohio")
+print("[Ohio] Infernal-style UI | F8 toggle | drag title bar")
