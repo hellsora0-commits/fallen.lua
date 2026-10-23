@@ -16,15 +16,15 @@ local CFG = {
     aim_on = false,
     aim_vk = 0x02,
     fov = 200,
-    smooth = 0.30,
+    smooth = 0.55,
     range = 1200,
     bone = 0,
     sticky = true,
     pred_on = true,
-    pred_strength = 1.15,
-    ping_ms = 55,
-    drop_on = true,
-    drop_strength = 0.80,
+    pred_strength = 0.75,
+    ping_ms = 40,
+    drop_on = false,
+    drop_strength = 0.25,
     speed_override = 0,
     draw_fov = true,
     draw_pred = true,
@@ -385,13 +385,13 @@ local function is_enemy(p)
 end
 
 local function auto_speed(dist)
+    -- Ohio projectiles are relatively fast; underestimating speed = overlead = miss
     if CFG.speed_override and CFG.speed_override > 0 then return CFG.speed_override end
-    if dist < 80 then return 1150
-    elseif dist < 160 then return 1400
-    elseif dist < 300 then return 1650
-    elseif dist < 500 then return 1900
-    elseif dist < 800 then return 2150
-    else return 2400 end
+    if dist < 60 then return 1800
+    elseif dist < 150 then return 2000
+    elseif dist < 300 then return 2200
+    elseif dist < 500 then return 2400
+    else return 2600 end
 end
 
 local function velocity_of(p, id, x, y, z)
@@ -448,15 +448,52 @@ end
 
 local function predict_point(p, id, hx, hy, hz, lx, ly, lz)
     if not CFG.pred_on then return hx, hy, hz end
+
     local vx, vy, vz = velocity_of(p, id, hx, hy, hz)
     local dist = len3(hx - lx, hy - ly, hz - lz)
+    if dist < 1 then return hx, hy, hz end
+
+    -- horizontal speed only (ignore vertical jitter)
+    local hspd = math.sqrt(vx * vx + vz * vz)
+
+    -- standing / slow walk: aim head, no lead
+    if hspd < 4 then
+        return hx, hy, hz
+    end
+
+    local move_scale = 1.0
+    if hspd < 14 then
+        move_scale = (hspd - 4) / 10
+        if move_scale > 1 then move_scale = 1 end
+    end
+
     local speed = auto_speed(dist)
-    local str = CFG.pred_strength or 1.15
-    vx, vy, vz = vx * str, vy * str, vz * str
-    local t = intercept_t(lx, ly, lz, hx, hy, hz, vx, vy, vz, speed) + (CFG.ping_ms or 55) / 1000
-    local px, py, pz = hx + vx * t, hy + vy * t, hz + vz * t
-    if CFG.drop_on then
-        py = py + 0.5 * 130 * t * t * (CFG.drop_strength or 0.8)
+    local str = (CFG.pred_strength or 0.75) * move_scale
+    local ping = (CFG.ping_ms or 40) / 1000
+
+    -- time of flight (simple + reliable for Ohio)
+    local t = dist / speed + ping
+    if t > 0.55 then t = 0.55 end
+
+    -- ONLY XZ lead — keep head height (red dot was going into the ground)
+    local lx_ = vx * str * t
+    local lz_ = vz * str * t
+
+    -- hard cap lead distance in studs (main fix for "runs ahead but never hits")
+    local lead = math.sqrt(lx_ * lx_ + lz_ * lz_)
+    local MAX_LEAD = 7.5
+    if lead > MAX_LEAD then
+        local s = MAX_LEAD / lead
+        lx_, lz_ = lx_ * s, lz_ * s
+    end
+
+    local px = hx + lx_
+    local py = hy          -- never leave head height from velocity
+    local pz = hz + lz_
+
+    if CFG.drop_on and dist > 180 then
+        local g = 70
+        py = py + 0.5 * g * t * t * (CFG.drop_strength or 0.25)
     end
     return px, py, pz
 end
@@ -587,9 +624,14 @@ function OnFrame()
         circle(sx, sy, 4, { 1, 0.2, 0.2, 0.95 }, true)
     end
 
-    local sm = CFG.smooth or 0.30
+    local sm = CFG.smooth or 0.45
     if sm < 0.05 then sm = 0.05 end
-    move_mouse((sx - mx) * sm, (sy - my) * sm)
+    -- when close to crosshair, snap harder so pred point is actually reached
+    local dx, dy = sx - mx, sy - my
+    local pix = math.sqrt(dx * dx + dy * dy)
+    if pix < 25 then sm = math.min(1, sm + 0.35)
+    elseif pix < 60 then sm = math.min(1, sm + 0.15) end
+    move_mouse(dx * sm, dy * sm)
 end
 
 on_frame = OnFrame
