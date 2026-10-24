@@ -16,23 +16,29 @@ local CFG = {
     aim_on = false,
     aim_vk = 0x02,
     fov = 200,
-    smooth = 0.55,
+    smooth = 0.28,
     range = 1200,
     bone = 0,
     sticky = true,
     pred_on = true,
-    pred_strength = 0.75,
+    pred_strength = 0.65,
     ping_ms = 40,
     drop_on = false,
     drop_strength = 0.25,
     speed_override = 0,
     draw_fov = true,
     draw_pred = true,
+    air_pred = true,       -- kunai / fall / jump / rose air
+    boost_pred = true,     -- blockside / rose ground speed
+    air_strength = 1.35,   -- extra mult when airborne
+    boost_strength = 1.45, -- extra mult on speed items
+    air_max_lead = 24,     -- studs
+    boost_max_lead = 22,
 }
 
 local UI = {
     open = true,
-    x = 60, y = 60, w = 320, h = 420,
+    x = 60, y = 60, w = 320, h = 520,
     dragging = false,
     off_x = 0, off_y = 0,
     tab = 1,
@@ -41,6 +47,8 @@ local UI = {
 }
 
 local hist, sticky_id = {}, nil
+local pred_smooth = {}  -- id -> {x,y,z}
+local aim_sx, aim_sy = nil, nil
 local prev_lmb, prev_f8 = false, false
 local mx, my, lmb, lmb_click = 0, 0, false, false
 
@@ -343,7 +351,13 @@ local function draw_ui()
     else
         cy = ui_checkbox(lx, cy, "Draw FOV", "draw_fov")
         cy = ui_checkbox(lx, cy, "Show Predict Point", "draw_pred")
-        text(lx, cy + 6, "Drag window by title bar", MUTED, 12)
+        cy = ui_checkbox(lx, cy, "Air Predict (kunai/rose)", "air_pred")
+        cy = ui_slider2(lx, cy, sw, "Air Strength", "air_strength", 0.5, 2.0, true)
+        cy = ui_slider2(lx, cy, sw, "Air Max Lead", "air_max_lead", 8, 30, false)
+        cy = ui_checkbox(lx, cy, "Boost Predict (blockside/rose)", "boost_pred")
+        cy = ui_slider2(lx, cy, sw, "Boost Strength", "boost_strength", 0.5, 2.0, true)
+        cy = ui_slider2(lx, cy, sw, "Boost Max Lead", "boost_max_lead", 8, 28, false)
+        text(lx, cy + 4, "Drag by title | F8 toggle", MUTED, 12)
     end
 end
 
@@ -410,7 +424,7 @@ local function velocity_of(p, id, x, y, z)
         dvx = (x - h.x) / dt
         dvy = (y - h.y) / dt
         dvz = (z - h.z) / dt
-        local k = 0.38
+        local k = 0.22
         dvx = (h.dvx or dvx) * (1 - k) + dvx * k
         dvy = (h.dvy or dvy) * (1 - k) + dvy * k
         dvz = (h.dvz or dvz) * (1 - k) + dvz * k
@@ -447,55 +461,115 @@ local function intercept_t(ox, oy, oz, px, py, pz, vx, vy, vz, speed)
 end
 
 local function predict_point(p, id, hx, hy, hz, lx, ly, lz)
-    if not CFG.pred_on then return hx, hy, hz end
+    local rawx, rawy, rawz = hx, hy, hz
 
-    local vx, vy, vz = velocity_of(p, id, hx, hy, hz)
-    local dist = len3(hx - lx, hy - ly, hz - lz)
-    if dist < 1 then return hx, hy, hz end
+    if CFG.pred_on then
+        local vx, vy, vz = velocity_of(p, id, hx, hy, hz)
+        local dist = len3(hx - lx, hy - ly, hz - lz)
+        if dist >= 1 then
+            local hspd = math.sqrt(vx * vx + vz * vz)
+            local vspd = math.abs(vy)
 
-    -- horizontal speed only (ignore vertical jitter)
-    local hspd = math.sqrt(vx * vx + vz * vz)
+            -- Kunai / void jump / freefall / rose air mobility
+            local airborne = CFG.air_pred and (
+                vspd > 10
+                or (vspd > 6 and hspd < 12)
+                or (vy > 8)    -- kunai jump / rose hop
+                or (vy < -10)  -- freefall
+            )
 
-    -- standing / slow walk: aim head, no lead
-    if hspd < 4 then
-        return hx, hy, hz
+            -- Blockside / rose / kunai passive ground speed
+            local boosted = CFG.boost_pred and hspd > 18
+
+            if hspd < 3.5 and not airborne then
+                rawx, rawy, rawz = hx, hy, hz
+            else
+                local move_scale = 1.0
+                if not airborne and not boosted and hspd < 16 then
+                    move_scale = (hspd - 3.5) / 12.5
+                    if move_scale > 1 then move_scale = 1 end
+                    if move_scale < 0 then move_scale = 0 end
+                end
+
+                local speed = auto_speed(dist)
+                local str = (CFG.pred_strength or 0.65) * move_scale
+                local ping = (CFG.ping_ms or 40) / 1000
+                local tt = dist / speed + ping
+                if tt > 0.55 then tt = 0.55 end
+
+                local MAX_LEAD = 6.5
+
+                if boosted and not airborne then
+                    str = str * (CFG.boost_strength or 1.45)
+                    MAX_LEAD = CFG.boost_max_lead or 22
+                    tt = math.min(0.60, tt * 1.15)
+                end
+
+                if airborne then
+                    str = str * (CFG.air_strength or 1.35)
+                    MAX_LEAD = CFG.air_max_lead or 24
+                    tt = math.min(0.60, tt * 1.10)
+                    local lx_ = vx * str * tt
+                    local ly_ = vy * str * tt
+                    local lz_ = vz * str * tt
+                    -- freefall extra drop lead
+                    if vy < -8 then
+                        ly_ = ly_ + 0.5 * 110 * tt * tt * 0.55
+                    end
+                    -- rising kunai: slight damp so we don't shoot past peak
+                    if vy > 22 then
+                        ly_ = ly_ * 0.88
+                    end
+                    local lead3 = math.sqrt(lx_ * lx_ + ly_ * ly_ + lz_ * lz_)
+                    if lead3 > MAX_LEAD then
+                        local s = MAX_LEAD / lead3
+                        lx_, ly_, lz_ = lx_ * s, ly_ * s, lz_ * s
+                    end
+                    rawx = hx + lx_
+                    rawy = hy + ly_
+                    rawz = hz + lz_
+                else
+                    local lx_ = vx * str * tt
+                    local lz_ = vz * str * tt
+                    local lead = math.sqrt(lx_ * lx_ + lz_ * lz_)
+                    if lead > MAX_LEAD then
+                        local s = MAX_LEAD / lead
+                        lx_, lz_ = lx_ * s, lz_ * s
+                    end
+                    rawx = hx + lx_
+                    rawy = hy
+                    rawz = hz + lz_
+                    if CFG.drop_on and dist > 180 then
+                        rawy = hy + 0.5 * 70 * tt * tt * (CFG.drop_strength or 0.25)
+                    end
+                end
+            end
+        end
     end
 
-    local move_scale = 1.0
-    if hspd < 14 then
-        move_scale = (hspd - 4) / 10
-        if move_scale > 1 then move_scale = 1 end
+    -- EMA: faster follow for air/boost so we don't lag behind kunai/blockside
+    local ps = pred_smooth[id]
+    local a = 0.14
+    local dy = ps and math.abs(rawy - ps.y) or 0
+    local dxz = 0
+    if ps then
+        local dx = rawx - ps.x
+        local dz = rawz - ps.z
+        dxz = math.sqrt(dx * dx + dz * dz)
     end
-
-    local speed = auto_speed(dist)
-    local str = (CFG.pred_strength or 0.75) * move_scale
-    local ping = (CFG.ping_ms or 40) / 1000
-
-    -- time of flight (simple + reliable for Ohio)
-    local t = dist / speed + ping
-    if t > 0.55 then t = 0.55 end
-
-    -- ONLY XZ lead — keep head height (red dot was going into the ground)
-    local lx_ = vx * str * t
-    local lz_ = vz * str * t
-
-    -- hard cap lead distance in studs (main fix for "runs ahead but never hits")
-    local lead = math.sqrt(lx_ * lx_ + lz_ * lz_)
-    local MAX_LEAD = 7.5
-    if lead > MAX_LEAD then
-        local s = MAX_LEAD / lead
-        lx_, lz_ = lx_ * s, lz_ * s
+    if dy > 0.8 or dxz > 2.0 then
+        a = 0.62  -- aggressive track kunai/blockside
+    elseif dy > 0.3 or dxz > 1.0 then
+        a = 0.40
     end
-
-    local px = hx + lx_
-    local py = hy          -- never leave head height from velocity
-    local pz = hz + lz_
-
-    if CFG.drop_on and dist > 180 then
-        local g = 70
-        py = py + 0.5 * g * t * t * (CFG.drop_strength or 0.25)
+    if not ps then
+        pred_smooth[id] = { x = rawx, y = rawy, z = rawz }
+        return rawx, rawy, rawz
     end
-    return px, py, pz
+    ps.x = ps.x + (rawx - ps.x) * a
+    ps.y = ps.y + (rawy - ps.y) * a
+    ps.z = ps.z + (rawz - ps.z) * a
+    return ps.x, ps.y, ps.z
 end
 
 local function bone_world(p)
@@ -603,6 +677,7 @@ function OnFrame()
 
     if not key_down(CFG.aim_vk) then
         sticky_id = nil
+        aim_sx, aim_sy = nil, nil
         return
     end
 
@@ -624,14 +699,44 @@ function OnFrame()
         circle(sx, sy, 4, { 1, 0.2, 0.2, 0.95 }, true)
     end
 
-    local sm = CFG.smooth or 0.45
+    -- screen-space EMA (smooth aim point)
+    if aim_sx and aim_sy then
+        local sa = 0.16  -- lower = silkier
+        aim_sx = aim_sx + (sx - aim_sx) * sa
+        aim_sy = aim_sy + (sy - aim_sy) * sa
+    else
+        aim_sx, aim_sy = sx, sy
+    end
+
+    local sm = CFG.smooth or 0.28
     if sm < 0.05 then sm = 0.05 end
-    -- when close to crosshair, snap harder so pred point is actually reached
-    local dx, dy = sx - mx, sy - my
+    if sm > 0.70 then sm = 0.70 end
+
+    local dx = aim_sx - mx
+    local dy = aim_sy - my
     local pix = math.sqrt(dx * dx + dy * dy)
-    if pix < 25 then sm = math.min(1, sm + 0.35)
-    elseif pix < 60 then sm = math.min(1, sm + 0.15) end
-    move_mouse(dx * sm, dy * sm)
+
+    -- bigger deadzone = no micro jitter
+    if pix < 3.5 then return end
+
+    -- ease-out curve: strong far, very soft near crosshair
+    local t = pix / 180
+    if t > 1 then t = 1 end
+    -- smoothstep
+    local ease = t * t * (3 - 2 * t)
+    local gain = sm * (0.35 + 0.65 * ease)
+
+    -- cap max mouse step per frame (kills camera shake)
+    local step_x = dx * gain
+    local step_y = dy * gain
+    local step = math.sqrt(step_x * step_x + step_y * step_y)
+    local MAX_STEP = 28
+    if step > MAX_STEP then
+        local s = MAX_STEP / step
+        step_x, step_y = step_x * s, step_y * s
+    end
+
+    move_mouse(step_x, step_y)
 end
 
 on_frame = OnFrame
